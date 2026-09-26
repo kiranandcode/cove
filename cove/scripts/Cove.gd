@@ -1071,8 +1071,11 @@ func _input(event: InputEvent) -> void:
 			_bd_stop_edit()
 			get_viewport().set_input_as_handled()
 		return
-	# Esc leaves "present" (full-window) mode, swooping the camera back.
-	if event.keycode == KEY_ESCAPE and _present_id != -1:
+	# Shift+Esc leaves "present" (full-window) mode. Plain Esc belongs to the
+	# focused terminal, where interactive programs use it to cancel work.
+	if event.keycode == KEY_ESCAPE and event.shift_pressed \
+			and not event.meta_pressed and not event.ctrl_pressed and not event.alt_pressed \
+			and _present_id != -1:
 		_leave_present()
 		get_viewport().set_input_as_handled()
 		return
@@ -1319,8 +1322,8 @@ func _unhandled_input(event: InputEvent) -> void:
 							{"x": roundi(dp.x), "y": roundi(dp.y), "button": 0, "clicks": 2})
 					elif _press_group.terminal.page:
 						_page_activate(_press_group)   # and raise the tab in the browser
-				# Triple-click a termling -> present it full-window (click again or Esc
-				# to leave). A click on empty ground also leaves present mode.
+				# Triple-click a termling -> present it full-window (click again or
+				# Shift+Esc to leave). A click on empty ground also leaves present mode.
 				var now_ms := Time.get_ticks_msec()
 				var gid: int = _press_group.term_id if _press_group != null else -1
 				if gid != -1 and gid == _click_last_id and now_ms - _click_last_ms < 450:
@@ -1593,7 +1596,7 @@ func _spawn_terminal() -> void:
 
 
 # A Cmd+N termling waits here until its first frame arrives, then we present it:
-# the camera zooms to frame it (Esc swoops back). It keeps its default cols/rows.
+# the camera zooms to frame it (Shift+Esc swoops back). It keeps its default cols/rows.
 # Reflowing it to fill the view made giant termlings (200x88 when zoomed in; 320x96
 # when sized to the window's pixels), and every frame of a big terminal is copied
 # through the rgba transport, so size is lag. Ids drop out once framed.
