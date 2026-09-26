@@ -1159,6 +1159,7 @@ func _world_mouse() -> Vector2:
 # fling it off the window edge (plain drag); Alt-drag only relocates.
 func _begin_move(can_send: bool) -> void:
 	_set_focus(_press_group.term_id, false)   # moving it isn't attending to it
+	_follows.erase(_press_group.term_id)      # a user's drag overrides an old follow command
 	if _press_group.term_id == _tracking_id:
 		# The follow pauses while it's dragged (see _process); un-glue now so the
 		# camera eases over to where it lands instead of snapping there on drop.
