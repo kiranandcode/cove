@@ -601,7 +601,7 @@ TOOLS = [
      "description": "Your own termling: id, session, name, frame (container), agent, position. Errors if you're not running inside the Cove.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_terminals",
-     "description": "Every termling in the Cove: id, session, name, agent (claude/codex/opencode/shell), busy/attention, the frame it belongs to (container), cwd, project, title. Also the board's frames ('zones': id, name, rect). Read-only.",
+     "description": "Every termling in the Cove: id, session, name, agent (claude/codex/muse/opencode/shell), busy/attention, the frame it belongs to (container), cwd, project, title. Also the board's frames ('zones': id, name, rect). Read-only.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "board",
      "description": "Read the shapes on the Cove's board: the user's frames, boxes, text and arrows, plus agents' notes. mine=true returns only the shapes you own. Read-only.",
