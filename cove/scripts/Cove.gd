@@ -342,6 +342,7 @@ func _emacs_cmd_key(key: Key) -> void:
 
 
 func _exit_tree() -> void:
+	var refreshed_term_bindings := _bd_freeze_term_bindings(-1, false)
 	# Never leave a mirrored tab hidden because the Cove went away.
 	for id in _groups:
 		var t = _groups[id].terminal
@@ -355,7 +356,7 @@ func _exit_tree() -> void:
 		if task != -1:
 			WorkerThreadPool.wait_for_task_completion(task)
 	_write_durable()   # capture the latest names/positions before we go
-	if _bd_save_in >= 0.0:
+	if _bd_save_in >= 0.0 or refreshed_term_bindings:
 		_bd_save_now()   # the board saves on a debounce; flush a pending save
 
 
@@ -641,6 +642,7 @@ func _is_page_file(id: int) -> bool:
 
 func _remove_group(id: int) -> void:
 	if _groups.has(id):
+		_bd_freeze_term_bindings(id)
 		_groups[id].queue_free()
 		_groups.erase(id)
 	_page_meta.erase(id)
@@ -2281,6 +2283,92 @@ func _session_token(c: String) -> String:
 			return "cove-" + digits
 	return ""
 
+
+# Termling keys intentionally survive a transient kitty/Godot disappearance so
+# connectors can reattach when the session returns. Refresh their raw fallback
+# first, preventing a UV-bound end from jumping to its original position while
+# its target is absent.
+func _bd_freeze_term_bindings(id: int = -1, schedule_save := true) -> bool:
+	var keys := []
+	var loss_token := ""
+	if id != -1:
+		keys.append("term#%d" % id)
+		var session := str(_sessions.get(id, ""))
+		if session != "":
+			keys.append("term:" + session)
+		_bd_term_fallback_seq += 1
+		loss_token = "%d:%d" % [Time.get_ticks_usec(), _bd_term_fallback_seq]
+	var changed := false
+	for s in _bd_shapes:
+		var type := str(s["type"])
+		if not type in ["arrow", "line"]:
+			continue
+		var key_a := str(s.get("bind_a", ""))
+		var key_b := str(s.get("bind_b", ""))
+		var freeze_a: bool = keys.has(key_a) if id != -1 else (
+			key_a.begins_with("term") and _bd_bind_rect(key_a) != null)
+		var freeze_b: bool = keys.has(key_b) if id != -1 else (
+			key_b.begins_with("term") and _bd_bind_rect(key_b) != null)
+		if not freeze_a and not freeze_b:
+			continue
+		var ends = _bd_arrow_ends(s) if type == "arrow" else _bd_pts(s)
+		if ends.is_empty():
+			continue
+		if freeze_a:
+			changed = true
+			var point: Vector2 = ends[0]
+			if type == "arrow":
+				s["a"] = _bd_a(point)
+			else:
+				_bd_set_line_end(s, "a", point)
+			_bd_remember_term_point(s, "a", key_a, point)
+		if freeze_b:
+			changed = true
+			var last: Vector2 = ends[1] if type == "arrow" else ends[ends.size() - 1]
+			if type == "arrow":
+				s["b"] = _bd_a(last)
+			else:
+				_bd_set_line_end(s, "b", last)
+			_bd_remember_term_point(s, "b", key_b, last)
+	if id != -1:
+		for slot in _bd_term_last:
+			var last: Dictionary = _bd_term_last[slot]
+			if not keys.has(str(last["key"])):
+				continue
+			var fallback := last.duplicate(true)
+			fallback["keys"] = keys.duplicate()
+			fallback["token"] = loss_token
+			for key in keys:
+				_bd_term_cache_put(_bd_term_fallbacks,
+					_bd_term_fallback_slot(str(last["id"]), str(last["end"]), key), fallback)
+			var current = _bd_by_id.get(str(last["id"]), null)
+			var end := str(last["end"])
+			if typeof(current) == TYPE_DICTIONARY \
+					and keys.has(str(current.get("bind_" + end, ""))):
+				current["bind_" + end + "_fallback_token"] = loss_token
+	if changed and schedule_save:
+		_bd_dirty = true
+		_bd_save_in = 0.4
+	return changed
+
+
+func _bd_remember_term_point(s: Dictionary, end: String, key: String, p: Vector2) -> void:
+	_bd_term_cache_put(_bd_term_last, _bd_term_fallback_slot(str(s["id"]), end, key), {
+		"id": str(s["id"]), "end": end, "key": key, "point": _bd_a(p),
+	})
+
+
+func _bd_term_fallback_slot(shape_id: String, end: String, key: String) -> String:
+	return "%s|%s|%s" % [shape_id, end, key]
+
+
+func _bd_term_cache_put(cache: Dictionary, key: String, value: Dictionary) -> void:
+	cache.erase(key) # updating an entry also makes it the newest one
+	cache[key] = value
+	if cache.size() > BD_TERM_FALLBACK_CACHE:
+		var oldest := cache.keys()
+		for i in int(BD_TERM_FALLBACK_CACHE / 4):
+			cache.erase(oldest[i])
 
 # pid -> cwd for many pids in a single lsof call (`p<pid>` then `n<path>` lines).
 func _cwds_of(pids: Array) -> Dictionary:
@@ -4843,8 +4931,8 @@ func _update_panel() -> void:
 # =============================================================================
 #
 # Shapes live on the ground between the checkerboard and the termlings: boxes,
-# ellipses, diamonds, triangles, arrows (bendable; their ends stick to shapes and
-# to termlings), lines, freehand + highlighter, text, sticky notes, frames and
+# ellipses, diamonds, triangles, arrows and lines (their ends stick to shapes
+# and termlings; arrows can bend), freehand + highlighter, text, sticky notes, frames and
 # todo lists. The keys are tldraw's, and they only fire while no termling has
 # focus (every keystroke otherwise belongs to its shell): click empty ground to
 # unfocus, click a termling to type into it again. Frames and geo boxes are also
@@ -4879,6 +4967,8 @@ const BD_FONT_NAMES := {
 	"mono": ["Menlo", "Monaco", "Courier New"],
 }
 const BD_PAD := 12.0
+const BD_ARROW_BIND_GAP := 12.0   # 10 px tip gap plus stroke/rounding allowance
+const BD_TERM_FALLBACK_CACHE := 4096
 const BD_GEO := ["rectangle", "ellipse", "diamond", "triangle"]
 const BD_STICKY_TOOLS := ["hand", "draw", "highlight", "eraser", "laser"]  # stay armed after use
 const BD_ASSETS := "user://board-assets"   # images are copied in, so the board keeps them
@@ -4967,8 +5057,10 @@ var _bd_press_id := ""
 var _bd_shift := false
 var _bd_orig := {}              # id -> shape copy at gesture start
 var _bd_orig_box := Rect2()
+var _bd_binding_orig: Array = [] # external connector anchors affected by a resize
 var _bd_move_ids: Array = []
 var _bd_last_d := Vector2.ZERO
+var _bd_move_snapping := false
 var _bd_handle := {}
 var _bd_new_id := ""
 var _bd_marquee := Rect2()
@@ -4983,6 +5075,9 @@ var _bd_undo_stack: Array = []
 var _bd_redo_stack: Array = []
 var _bd_pre := ""               # snapshot taken when a change began
 var _bd_save_in := -1.0
+var _bd_term_last := {}          # connector-end -> latest raw point while its termling was live
+var _bd_term_fallbacks := {}     # connector-end -> fallback recorded when that termling disappeared
+var _bd_term_fallback_seq := 0
 var _bd_cmd_queue: Array = []   # agent commands held until the user's gesture/edit ends
 # text editing
 var _bd_edit_id := ""
@@ -5167,7 +5262,34 @@ func _bd_pts(s: Dictionary) -> PackedVector2Array:
 	var out := PackedVector2Array()
 	for p in s.get("points", []):
 		out.append(_bd_v(p))
+	if str(s.get("type", "")) == "line" and not out.is_empty():
+		var a = _bd_bound_uv_point(s, "a")
+		if a != null:
+			out[0] = a
+		var b = _bd_bound_uv_point(s, "b")
+		if b != null:
+			out[out.size() - 1] = b
 	return out
+
+
+# A connector end may store its location in the target's unrotated rectangle.
+# Resolving that normalized point on demand makes it follow target moves,
+# resizes and rotations while the raw point remains a safe fallback.
+func _bd_bound_uv_point(s: Dictionary, end: String):
+	var key := str(s.get("bind_" + end, ""))
+	var uv = s.get("bind_" + end + "_uv", null)
+	if key == "" or not (uv is Array) or uv.size() != 2:
+		return null
+	var r = _bd_bind_rect(key)
+	if r == null:
+		return null
+	var rect: Rect2 = r
+	var local := rect.position + rect.size * Vector2(float(uv[0]), float(uv[1]))
+	var offset = s.get("bind_" + end + "_offset", null)
+	if offset is Array and offset.size() == 2:
+		local += _bd_v(offset)
+	var target = _bd_by_id.get(key, null)
+	return _bd_xform(target) * local if target != null else local
 
 
 func _bd_pts_bounds(pts: PackedVector2Array) -> Rect2:
@@ -5232,16 +5354,26 @@ func _bd_add(s: Dictionary) -> void:
 
 
 func _bd_remove(ids: Array) -> void:
-	# Arrows pointing at a doomed shape keep their end where it was.
+	# Connectors pointing at a doomed shape keep their end where it was.
 	for s in _bd_shapes:
-		if str(s["type"]) == "arrow" and not ids.has(str(s["id"])):
-			var e := _bd_arrow_ends(s)
+		var type := str(s["type"])
+		if type in ["arrow", "line"] and not ids.has(str(s["id"])):
+			var e = _bd_arrow_ends(s) if type == "arrow" else _bd_pts(s)
+			if e.is_empty():
+				continue
 			if ids.has(str(s.get("bind_a", ""))):
-				s["a"] = _bd_a(e[0])
-				s["bind_a"] = ""
+				if type == "arrow":
+					s["a"] = _bd_a(e[0])
+				else:
+					_bd_set_line_end(s, "a", e[0])
+				_bd_clear_binding(s, "a")
 			if ids.has(str(s.get("bind_b", ""))):
-				s["b"] = _bd_a(e[1])
-				s["bind_b"] = ""
+				var last: Vector2 = e[1] if type == "arrow" else e[e.size() - 1]
+				if type == "arrow":
+					s["b"] = _bd_a(last)
+				else:
+					_bd_set_line_end(s, "b", last)
+				_bd_clear_binding(s, "b")
 	_bd_shapes = _bd_shapes.filter(func(s): return not ids.has(str(s["id"])))
 	_bd_reindex()
 
@@ -5406,13 +5538,19 @@ func _bd_arrow_ends(s: Dictionary) -> Array:
 	var kb := str(s.get("bind_b", ""))
 	var ra = _bd_bind_rect(ka)
 	var rb = _bd_bind_rect(kb)
-	var ca: Vector2 = ra.get_center() if ra != null else a
-	var cb: Vector2 = rb.get_center() if rb != null else b
+	var anchor_a = _bd_bound_uv_point(s, "a")
+	var anchor_b = _bd_bound_uv_point(s, "b")
+	var ca: Vector2 = anchor_a if anchor_a != null else (ra.get_center() if ra != null else a)
+	var cb: Vector2 = anchor_b if anchor_b != null else (rb.get_center() if rb != null else b)
 	var bend := float(s.get("bend", 0.0))
 	var mid0 := (ca + cb) * 0.5 + _bd_perp(cb - ca) * bend
-	if ra != null:
+	if anchor_a != null:
+		a = anchor_a
+	elif ra != null:
 		a = _bd_clip_out(ka, ra, mid0 if bend != 0.0 else cb)
-	if rb != null:
+	if anchor_b != null:
+		b = anchor_b
+	elif rb != null:
 		b = _bd_clip_out(kb, rb, mid0 if bend != 0.0 else ca)
 	return [a, b, (a + b) * 0.5 + _bd_perp(b - a) * bend]
 
@@ -5572,20 +5710,194 @@ func _anc_draw_label(ci: CanvasItem, key: String, at: Vector2, c: Color) -> void
 		HORIZONTAL_ALIGNMENT_LEFT, -1, fs, c)
 
 
-# The thing an arrow end dropped at p should stick to: a termling (they're
-# drawn on top), else the topmost box, preferring anything over a frame.
-func _bd_bind_at(p: Vector2, exclude: String) -> String:
-	var g := _group_at(p)
-	if g != null:
-		return _bd_term_key(g.term_id)
-	for want_frame in [false, true]:
+# The nearest point on a closed outline. Shape polygons here are small (at most
+# the ellipse's 64 points), and this only runs while a connector is manipulated.
+func _bd_closest_outline(p: Vector2, poly: PackedVector2Array) -> Vector2:
+	if poly.is_empty():
+		return p
+	var closest := poly[0]
+	var best := INF
+	for i in poly.size():
+		var q := Geometry2D.get_closest_point_to_segment(p, poly[i], poly[(i + 1) % poly.size()])
+		var d := p.distance_squared_to(q)
+		if d < best:
+			best = d
+			closest = q
+	return closest
+
+
+# The edge point nearest p, both in world space and as a normalized coordinate
+# in the target's unrotated rectangle. The latter is what lets line endpoints
+# keep their exact place along an edge through target resize and rotation.
+func _bd_bind_edge(key: String, p: Vector2) -> Dictionary:
+	var found = _bd_bind_rect(key)
+	if found == null:
+		return {}
+	var r: Rect2 = found
+	var target = _bd_by_id.get(key, null)
+	var local := _bd_local(target, p) if target != null else p
+	var poly := _bd_geo_poly(target) if target != null else PackedVector2Array([
+		r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y)])
+	var edge := _bd_closest_outline(local, poly)
+	var uv := Vector2(
+		(edge.x - r.position.x) / r.size.x if absf(r.size.x) > 0.0001 else 0.5,
+		(edge.y - r.position.y) / r.size.y if absf(r.size.y) > 0.0001 else 0.5)
+	uv.x = clampf(uv.x, 0.0, 1.0)
+	uv.y = clampf(uv.y, 0.0, 1.0)
+	var world: Vector2 = _bd_xform(target) * edge if target != null else edge
+	return {"point": world, "uv": uv, "offset": local - edge, "distance": p.distance_to(world)}
+
+
+func _bd_bind_outline(key: String) -> PackedVector2Array:
+	var found = _bd_bind_rect(key)
+	if found == null:
+		return PackedVector2Array()
+	var r: Rect2 = found
+	var target = _bd_by_id.get(key, null)
+	var local := _bd_geo_poly(target) if target != null else PackedVector2Array([
+		r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y)])
+	if target == null:
+		return local
+	var world := PackedVector2Array()
+	var xf := _bd_xform(target)
+	for p in local:
+		world.append(xf * p)
+	return world
+
+
+# The thing a connector end dropped at p should stick to: a termling (they're
+# drawn on top), else the topmost box, preferring anything over a frame. Arrow
+# tips render ten world units beyond their target, so their acquisition radius
+# includes that gap. Lines use outline_only with no gap.
+func _bd_bind_at(p: Vector2, exclude, outline_only := false, gap := BD_ARROW_BIND_GAP,
+		allow_near := true) -> String:
+	var excluded: Array = exclude if exclude is Array else [str(exclude)]
+	var slop := gap + _bd_tol()
+	var inside_fallback := ""
+	var frame_fallback := ""
+	if not outline_only:
+		var g := _group_at(p)
+		if g != null:
+			var key := _bd_term_key(g.term_id)
+			var zone := str(_zone_of.get(g.term_id, ""))
+			if not excluded.has(key) and (zone == "" or not excluded.has(zone)):
+				return key
 		for i in range(_bd_shapes.size() - 1, -1, -1):
 			var s: Dictionary = _bd_shapes[i]
-			if str(s["id"]) == exclude or not _bd_is_box(s) or (str(s["type"]) == "frame") != want_frame:
+			if excluded.has(str(s["id"])) or not _bd_is_box(s) or not _bd_shown(s):
 				continue
-			if _bd_rect(s).has_point(_bd_local(s, p)):
-				return str(s["id"])
-	return ""
+			if _bd_binding_contains(str(s["id"]), p):
+				if str(s["type"]) != "frame":
+					inside_fallback = str(s["id"])
+					break
+				if frame_fallback == "":
+					frame_fallback = str(s["id"])
+	var best_key := ""
+	var best_d := INF
+	var best_rank := 99
+	var near_limit := slop if allow_near else 0.001
+	for id in _groups:
+		var key := _bd_term_key(id)
+		var zone := str(_zone_of.get(id, ""))
+		if excluded.has(key) or (zone != "" and excluded.has(zone)):
+			continue
+		var term_rect = _bd_bind_rect(key)
+		if term_rect == null or not (term_rect as Rect2).grow(near_limit).has_point(p):
+			continue
+		var edge := _bd_bind_edge(key, p)
+		var term_d := float(edge.get("distance", INF))
+		if term_d <= near_limit and term_d < best_d:
+			best_key = key
+			best_d = term_d
+			best_rank = 0
+	for i in range(_bd_shapes.size() - 1, -1, -1):
+		var s: Dictionary = _bd_shapes[i]
+		if excluded.has(str(s["id"])) or not _bd_is_box(s) or not _bd_shown(s):
+			continue
+		var local := _bd_local(s, p)
+		if not _bd_rect(s).grow(near_limit).has_point(local):
+			continue
+		var edge := _bd_bind_edge(str(s["id"]), p)
+		var shape_d := float(edge.get("distance", INF))
+		var rank := 2 if str(s["type"]) == "frame" else 1
+		if shape_d <= near_limit and (shape_d < best_d - 0.001 \
+				or (absf(shape_d - best_d) <= 0.001 and rank < best_rank)):
+			best_key = str(s["id"])
+			best_d = shape_d
+			best_rank = rank
+	if best_key != "" and (best_rank < 2 or inside_fallback == ""):
+		return best_key
+	return inside_fallback if inside_fallback != "" else frame_fallback
+
+
+func _bd_set_line_end(s: Dictionary, end: String, p: Vector2) -> void:
+	var pts: Array = s["points"]
+	if pts.is_empty():
+		return
+	pts[0 if end == "a" else pts.size() - 1] = _bd_a(p)
+
+
+func _bd_clear_binding(s: Dictionary, end: String) -> void:
+	s["bind_" + end] = ""
+	s.erase("bind_" + end + "_uv")
+	s.erase("bind_" + end + "_offset")
+	s.erase("bind_" + end + "_fallback_token")
+
+
+func _bd_binding_contains(key: String, p: Vector2) -> bool:
+	var r = _bd_bind_rect(key)
+	if r == null:
+		return false
+	var target = _bd_by_id.get(key, null)
+	var local := _bd_local(target, p) if target != null else p
+	if target != null and str(target["type"]) == "geo":
+		return Geometry2D.is_point_in_polygon(local, _bd_geo_poly(target))
+	return (r as Rect2).has_point(local)
+
+
+func _bd_store_binding_anchor(s: Dictionary, end: String, key: String,
+		edge: Dictionary, keep_offset: bool) -> void:
+	var uv: Vector2 = edge["uv"]
+	s["bind_" + end] = key
+	s.erase("bind_" + end + "_fallback_token")
+	s["bind_" + end + "_uv"] = [snappedf(uv.x, 0.00001), snappedf(uv.y, 0.00001)]
+	if keep_offset:
+		s["bind_" + end + "_offset"] = _bd_a(edge["offset"])
+	else:
+		s.erase("bind_" + end + "_offset")
+
+
+func _bd_set_arrow_binding(s: Dictionary, end: String, p: Vector2,
+		outline_only := false, exclude = null, allow_near := true) -> String:
+	var skip = str(s["id"]) if exclude == null else exclude
+	var key := _bd_bind_at(p, skip, outline_only, BD_ARROW_BIND_GAP, allow_near)
+	_bd_clear_binding(s, end)
+	if key == "":
+		return ""
+	s["bind_" + end] = key
+	var edge := _bd_bind_edge(key, p)
+	if not edge.is_empty() and float(edge["distance"]) <= BD_ARROW_BIND_GAP + _bd_tol():
+		# A near-edge drop keeps the exact visible tip instead of jumping to the
+		# target-centre ray used by legacy arrows dropped deep inside a shape.
+		_bd_store_binding_anchor(s, end, key, edge, true)
+	return key
+
+
+# Lines attach only at an outline, never merely because an endpoint happens to
+# sit somewhere inside a large frame. Their stored raw point is snapped to that
+# outline and remains the fallback if the target later disappears.
+func _bd_set_line_binding(s: Dictionary, end: String, p: Vector2, exclude = null) -> String:
+	var skip = str(s["id"]) if exclude == null else exclude
+	var key := _bd_bind_at(p, skip, true, 0.0)
+	_bd_clear_binding(s, end)
+	if key == "":
+		return ""
+	var edge := _bd_bind_edge(key, p)
+	if edge.is_empty():
+		return ""
+	_bd_store_binding_anchor(s, end, key, edge, false)
+	_bd_set_line_end(s, end, edge["point"])
+	return key
 
 
 # --- board: hit testing + selection ---------------------------------------------
@@ -5791,12 +6103,13 @@ func _bd_pointer_down(p: Vector2, ev: InputEventMouseButton) -> void:
 			var s := _bd_new("arrow")
 			s["a"] = _bd_a(p)
 			s["b"] = _bd_a(p)
-			s["bind_a"] = _bd_bind_at(p, "")
+			s["bind_a"] = ""
 			s["bind_b"] = ""
 			s["bend"] = 0.0
 			s["head_a"] = false
 			s["head_b"] = true
 			_bd_add(s)
+			_bd_set_arrow_binding(s, "a", p, false, null, _bd_snapping(ev))
 			_bd_new_id = str(s["id"])
 			_bd_sel = [_bd_new_id]
 			_bd_handle = {"kind": "b"}
@@ -5805,7 +6118,11 @@ func _bd_pointer_down(p: Vector2, ev: InputEventMouseButton) -> void:
 			_bd_begin()
 			var s := _bd_new("line")
 			s["points"] = [_bd_a(p), _bd_a(p)]
+			s["bind_a"] = ""
+			s["bind_b"] = ""
 			_bd_add(s)
+			if _bd_snapping(ev):
+				_bd_set_line_binding(s, "a", p)
 			_bd_new_id = str(s["id"])
 			_bd_sel = [_bd_new_id]
 			_bd_handle = {"kind": "pt", "i": 1}
@@ -5961,7 +6278,10 @@ func _bd_pointer_up(p: Vector2, _ev: InputEventMouseButton) -> void:
 			elif not _bd_shift and _bd_press_id != "":
 				_bd_sel = _bd_with_groups([_bd_press_id])
 		"move":
+			if _bd_move_snapping:
+				_bd_rebind_moved_connectors(_bd_sel, _bd_move_ids)
 			_bd_move_ids = []
+			_bd_move_snapping = false
 			# A file card let go over a termling types its path there and goes back.
 			var fc = _bd_by_id.get(_bd_sel[0], null) if _bd_sel.size() == 1 else null
 			var tg := _group_at(p) if fc != null and str(fc["type"]) == "file" else null
@@ -5983,6 +6303,7 @@ func _bd_pointer_up(p: Vector2, _ev: InputEventMouseButton) -> void:
 			else:
 				_bd_finish_create()
 				_bd_commit()
+			_bd_binding_orig = []
 		"box":
 			var s = _bd_by_id.get(_bd_new_id, null)
 			if s != null and not _bd_moved:
@@ -6060,6 +6381,8 @@ func _bd_cancel_gesture() -> void:
 	_bd_g = ""
 	_bd_new_id = ""
 	_bd_move_ids = []
+	_bd_move_snapping = false
+	_bd_binding_orig = []
 	_bd_bind_hint = ""
 	_bd_erase = {}
 
@@ -6071,6 +6394,84 @@ func _bd_snap_orig() -> void:
 	for i in _bd_sel:
 		_bd_orig[i] = _bd_by_id[i].duplicate(true)
 	_bd_orig_box = _bd_sel_box()
+	_bd_binding_orig = _bd_binding_anchor_snapshot(_bd_orig) \
+		if str(_bd_handle.get("kind", "")) == "resize" else []
+
+
+# Existing boards can contain connectors that look attached but predate binding
+# metadata. When targets move, adopt external endpoints close to their outlines.
+# Candidate boxes are built once, then cheap AABB checks reject almost all pairs.
+func _bd_adopt_touching_connectors(moving_ids: Array) -> void:
+	var moving := {}
+	for id in moving_ids:
+		moving[id] = true
+	var targets := []
+	for i in range(_bd_shapes.size() - 1, -1, -1):
+		var target: Dictionary = _bd_shapes[i]
+		if moving.has(str(target["id"])) and _bd_is_box(target) and _bd_shown(target):
+			targets.append({"id": str(target["id"]), "shape": target,
+				"bounds": _bd_bounds(target), "rank": 2 if str(target["type"]) == "frame" else 1})
+	if targets.is_empty():
+		return
+	for s in _bd_shapes:
+		var type := str(s["type"])
+		if not type in ["arrow", "line"] or moving.has(str(s["id"])) or not _bd_shown(s):
+			continue
+		var ends = _bd_arrow_ends(s) if type == "arrow" else _bd_pts(s)
+		if ends.is_empty():
+			continue
+		var inside_frames := {}
+		for end in ["a", "b"]:
+			if str(s.get("bind_" + end, "")) != "":
+				continue
+			var p: Vector2 = ends[0 if end == "a" else (1 if type == "arrow" else ends.size() - 1)]
+			var slop := (BD_ARROW_BIND_GAP if type == "arrow" else 0.0) + _bd_tol()
+			var best := {}
+			var best_d := INF
+			var best_rank := 99
+			for candidate in targets:
+				if not (candidate["bounds"] as Rect2).grow(slop).has_point(p):
+					continue
+				var target: Dictionary = candidate["shape"]
+				var target_id := str(candidate["id"])
+				if str(target["type"]) == "frame":
+					if not inside_frames.has(target_id):
+						inside_frames[target_id] = _bd_connector_inside_frame(s, target)
+					if bool(inside_frames[target_id]):
+						continue
+				var edge := _bd_bind_edge(target_id, p)
+				var distance := float(edge.get("distance", INF))
+				var rank := int(candidate["rank"])
+				if distance <= slop and (distance < best_d - 0.001 \
+						or (absf(distance - best_d) <= 0.001 and rank < best_rank)):
+					best = {"id": target_id, "edge": edge}
+					best_d = distance
+					best_rank = rank
+			if best.is_empty():
+				continue
+			_bd_store_binding_anchor(s, end, str(best["id"]), best["edge"], type == "arrow")
+			if type == "line":
+				_bd_set_line_end(s, end, best["edge"]["point"])
+
+
+func _bd_connector_inside_frame(s: Dictionary, frame: Dictionary) -> bool:
+	var points := _bd_arrow_curve(s) if str(s["type"]) == "arrow" else _bd_pts(s)
+	if points.is_empty():
+		return false
+	var r := _bd_rect(frame)
+	for p in points:
+		if not r.grow(0.001).has_point(_bd_local(frame, p)):
+			return false
+	return true
+
+
+func _bd_binding_moves_with(key: String, moving_ids: Array) -> bool:
+	if moving_ids.has(key):
+		return true
+	if key.begins_with("term"):
+		var id := _bd_term_id(key)
+		return id != -1 and moving_ids.has(str(_zone_of.get(id, "")))
+	return false
 
 
 func _bd_start_move(duplicate: bool) -> void:
@@ -6086,25 +6487,43 @@ func _bd_start_move(duplicate: bool) -> void:
 		var fr := _bd_rect(f)
 		for s in _bd_shapes:
 			var sid := str(s["id"])
-			if not ids.has(sid) and fr.encloses(_bd_bounds(s)):
+			if ids.has(sid):
+				continue
+			var inside := fr.encloses(_bd_bounds(s))
+			if _bd_rot(f) != 0.0 and str(s["type"]) in ["arrow", "line"]:
+				inside = _bd_connector_inside_frame(s, f)
+			if inside:
 				ids.append(sid)
-	# An arrow dragged away from what it points at lets go of it.
+	if not duplicate:
+		_bd_adopt_touching_connectors(ids)
+	# A connector dragged away from what it points at lets go of it.
 	for i in ids:
 		var s: Dictionary = _bd_by_id[i]
-		if str(s["type"]) != "arrow":
+		var type := str(s["type"])
+		if not type in ["arrow", "line"]:
 			continue
-		var e := _bd_arrow_ends(s)
-		if str(s.get("bind_a", "")) != "" and not ids.has(str(s["bind_a"])):
-			s["a"] = _bd_a(e[0])
-			s["bind_a"] = ""
-		if str(s.get("bind_b", "")) != "" and not ids.has(str(s["bind_b"])):
-			s["b"] = _bd_a(e[1])
-			s["bind_b"] = ""
+		var e = _bd_arrow_ends(s) if type == "arrow" else _bd_pts(s)
+		if e.is_empty():
+			continue
+		if str(s.get("bind_a", "")) != "" and not _bd_binding_moves_with(str(s["bind_a"]), ids):
+			if type == "arrow":
+				s["a"] = _bd_a(e[0])
+			else:
+				_bd_set_line_end(s, "a", e[0])
+			_bd_clear_binding(s, "a")
+		if str(s.get("bind_b", "")) != "" and not _bd_binding_moves_with(str(s["bind_b"]), ids):
+			var last: Vector2 = e[1] if type == "arrow" else e[e.size() - 1]
+			if type == "arrow":
+				s["b"] = _bd_a(last)
+			else:
+				_bd_set_line_end(s, "b", last)
+			_bd_clear_binding(s, "b")
 	_bd_orig = {}
 	for i in ids:
 		_bd_orig[i] = _bd_by_id[i].duplicate(true)
 	_bd_move_ids = ids
 	_bd_last_d = Vector2.ZERO
+	_bd_move_snapping = false
 	_bd_orig_box = _bd_sel_box()
 	_bd_snap_cache = _bd_snap_targets(ids)
 	_bd_g = "move"
@@ -6117,7 +6536,8 @@ func _bd_do_move(p: Vector2, ev: InputEventWithModifiers) -> void:
 			d.y = 0.0
 		else:
 			d.x = 0.0
-	if _bd_snapping(ev):
+	_bd_move_snapping = _bd_snapping(ev)
+	if _bd_move_snapping:
 		d += _bd_snap_offset(Rect2(_bd_orig_box.position + d, _bd_orig_box.size))
 	else:
 		_bd_guides = []
@@ -6143,6 +6563,33 @@ func _bd_translate(s: Dictionary, o: Dictionary, d: Vector2) -> void:
 		_:
 			s["x"] = float(o["x"]) + d.x
 			s["y"] = float(o["y"]) + d.y
+
+
+# A whole-connector move uses the ordinary alignment snap while it is in flight.
+# On release, turn only endpoints actually near an outline into relationships.
+# Targets moved in the same gesture are excluded; existing bindings to them were
+# retained above and an unrelated jointly selected shape should not be adopted.
+func _bd_rebind_moved_connectors(ids: Array, moved_ids: Array) -> void:
+	for id in ids:
+		var s = _bd_by_id.get(id, null)
+		if s == null:
+			continue
+		var type := str(s["type"])
+		if type == "arrow":
+			var ends := _bd_arrow_ends(s)
+			for end in ["a", "b"]:
+				if str(s.get("bind_" + end, "")) != "":
+					continue
+				var p: Vector2 = ends[0 if end == "a" else 1]
+				_bd_set_arrow_binding(s, end, p, true, moved_ids)
+		elif type == "line":
+			var pts := _bd_pts(s)
+			if pts.is_empty():
+				continue
+			if str(s.get("bind_a", "")) == "":
+				_bd_set_line_binding(s, "a", pts[0], moved_ids)
+			if str(s.get("bind_b", "")) == "":
+				_bd_set_line_binding(s, "b", pts[pts.size() - 1], moved_ids)
 
 
 # Termlings living in a moved frame/box walk along with it.
@@ -6181,9 +6628,7 @@ func _bd_do_handle(p: Vector2, ev: InputEventWithModifiers) -> void:
 			if ev.shift_pressed:
 				q = _bd_snap_angle(_bd_arrow_ends(s)[1 if kind == "a" else 0], p)
 			s[kind] = _bd_a(q)
-			var key := _bd_bind_at(p, str(s["id"]))
-			s["bind_" + kind] = key
-			_bd_bind_hint = key
+			_bd_bind_hint = _bd_set_arrow_binding(s, kind, q, false, null, _bd_snapping(ev))
 		"bend":
 			var e := _bd_arrow_ends(s)
 			var a: Vector2 = e[0]
@@ -6193,10 +6638,18 @@ func _bd_do_handle(p: Vector2, ev: InputEventWithModifiers) -> void:
 		"pt":
 			var i := int(_bd_handle["i"])
 			var pts: Array = s["points"]
+			var resolved := _bd_pts(s)
 			var q := p
 			if ev.shift_pressed and pts.size() > 1:
-				q = _bd_snap_angle(_bd_v(pts[i - 1 if i > 0 else 1]), p)
+				q = _bd_snap_angle(resolved[i - 1 if i > 0 else 1], p)
 			pts[i] = _bd_a(q)
+			if i == 0 or i == pts.size() - 1:
+				var end := "a" if i == 0 else "b"
+				if _bd_snapping(ev):
+					_bd_bind_hint = _bd_set_line_binding(s, end, q)
+				else:
+					_bd_clear_binding(s, end)
+					_bd_bind_hint = ""
 
 
 # Scale the selection about the handle's opposite side (or its centre with ⌥).
@@ -6240,10 +6693,58 @@ func _bd_do_resize(p: Vector2, ev: InputEventWithModifiers) -> void:
 			var nr := _bd_rect(s)
 			var nc := c + (nr.get_center() - c).rotated(rot)
 			_bd_set_rect(s, Rect2(nc - nr.size * 0.5, nr.size))
+		_bd_apply_binding_scale(_bd_binding_orig, Vector2(sx, sy))
 		return
 	for i in _bd_orig:
 		if _bd_by_id.has(i):
 			_bd_scale(_bd_by_id[i], _bd_orig[i], anchor, Vector2(sx, sy))
+	_bd_apply_binding_scale(_bd_binding_orig, Vector2(sx, sy))
+
+
+# Capture every connector anchor whose target is about to be transformed. The
+# connector need not itself be selected: an external line must follow a frame
+# that is resized through its opposite edge too.
+func _bd_binding_anchor_snapshot(targets: Dictionary) -> Array:
+	var out := []
+	for s in _bd_shapes:
+		if not str(s["type"]) in ["arrow", "line"]:
+			continue
+		for end in ["a", "b"]:
+			var key := str(s.get("bind_" + end, ""))
+			var uv = s.get("bind_" + end + "_uv", null)
+			if not targets.has(key) or not (uv is Array) or uv.size() != 2:
+				continue
+			var item := {"id": str(s["id"]), "end": end, "key": key,
+				"uv": [float(uv[0]), float(uv[1])]}
+			var offset = s.get("bind_" + end + "_offset", null)
+			if offset is Array and offset.size() == 2:
+				item["offset"] = [float(offset[0]), float(offset[1])]
+			out.append(item)
+	return out
+
+
+# Restore anchors from the gesture snapshot on every motion, then mirror the
+# target-local axes that crossed zero. This avoids cumulative flips while the
+# pointer moves back and forth across the resize anchor.
+func _bd_apply_binding_scale(originals: Array, k: Vector2) -> void:
+	for item in originals:
+		var s = _bd_by_id.get(str(item["id"]), null)
+		var end := str(item["end"])
+		if s == null or str(s.get("bind_" + end, "")) != str(item["key"]):
+			continue
+		var uv := _bd_v(item["uv"])
+		if k.x < 0.0:
+			uv.x = 1.0 - uv.x
+		if k.y < 0.0:
+			uv.y = 1.0 - uv.y
+		s["bind_" + end + "_uv"] = [snappedf(uv.x, 0.00001), snappedf(uv.y, 0.00001)]
+		if item.has("offset"):
+			var offset := _bd_v(item["offset"])
+			if k.x < 0.0:
+				offset.x = -offset.x
+			if k.y < 0.0:
+				offset.y = -offset.y
+			s["bind_" + end + "_offset"] = _bd_a(offset)
 
 
 # `world` scaling (a group, a flip) mirrors a rotated box's angle when it flips;
@@ -6651,7 +7152,7 @@ func _bd_live_sig() -> int:
 		# point (within 2x the bend of the chord), so this box is a cheap, safe
 		# superset of the drawing's cull test (which computes the whole curve).
 		var cull: Rect2
-		if rects[0] != null and rects[1] != null:
+		if str(s["type"]) == "arrow" and rects[0] != null and rects[1] != null:
 			cull = (rects[0] as Rect2).merge(rects[1]).grow(absf(float(s.get("bend", 0.0))) * 2.0 + 200.0)
 		else:
 			cull = _bd_bounds(s).grow(48.0)
@@ -6675,9 +7176,9 @@ func _bd_live_shapes() -> Array:
 	return _bd_live_list
 
 
-# An arrow with an end on a termling: it moves whenever the termling wanders.
+# A connector with an end on a termling moves whenever the termling wanders.
 func _bd_is_live(s: Dictionary) -> bool:
-	return str(s["type"]) == "arrow" and (str(s.get("bind_a", "")).begins_with("term") \
+	return str(s["type"]) in ["arrow", "line"] and (str(s.get("bind_a", "")).begins_with("term") \
 		or str(s.get("bind_b", "")).begins_with("term") or _anc_bound(s))
 
 
@@ -6927,10 +7428,10 @@ func _bd_draw_overlay() -> void:
 	var z := _cam.zoom.x
 	var lw := 1.5 / z
 	if _bd_bind_hint != "":
-		var hint = _bd_bind_rect(_bd_bind_hint)
-		if hint != null:
-			var hr: Rect2 = hint
-			o.draw_rect(hr.grow(6.0 / z), BD_SEL, false, 2.5 / z)
+		var outline := _bd_bind_outline(_bd_bind_hint)
+		if not outline.is_empty():
+			outline.append(outline[0])
+			o.draw_polyline(outline, BD_SEL, 2.5 / z, true)
 	if not _bd_sel.is_empty() and _bd_edit_id != "":
 		o.draw_rect(_bd_sel_box().grow(4.0 / z), Color(BD_SEL, 0.5), false, lw)
 	elif not _bd_sel.is_empty():
@@ -7233,13 +7734,15 @@ func _bd_camera_changed() -> void:
 
 # --- board: edit operations ------------------------------------------------------
 
-func _bd_snapshot() -> String:
+func _bd_snapshot(refresh_term_fallbacks := false) -> String:
+	if refresh_term_fallbacks:
+		_bd_freeze_term_bindings(-1, false)
 	return JSON.stringify(_bd_shapes)
 
 
 func _bd_begin() -> void:
 	if _bd_pre == "":
-		_bd_pre = _bd_snapshot()
+		_bd_pre = _bd_snapshot(true)
 
 
 func _bd_commit() -> void:
@@ -7257,10 +7760,35 @@ func _bd_commit() -> void:
 	_bd_pre = ""
 
 
+func _bd_apply_missing_term_fallbacks(shapes: Array) -> void:
+	for s in shapes:
+		var type := str(s.get("type", ""))
+		if not type in ["arrow", "line"]:
+			continue
+		for end in ["a", "b"]:
+			var key := str(s.get("bind_" + end, ""))
+			var slot := _bd_term_fallback_slot(str(s.get("id", "")), end, key)
+			var fallback = _bd_term_fallbacks.get(slot, null)
+			if typeof(fallback) != TYPE_DICTIONARY:
+				continue
+			var keys: Array = fallback.get("keys", [])
+			var token := str(fallback.get("token", ""))
+			if not keys.has(key) or _bd_bind_rect(key) != null \
+					or str(s.get("bind_" + end + "_fallback_token", "")) == token:
+				continue
+			var point := _bd_v(fallback["point"])
+			if type == "arrow":
+				s[end] = _bd_a(point)
+			else:
+				_bd_set_line_end(s, end, point)
+			s["bind_" + end + "_fallback_token"] = token
+
+
 func _bd_restore(snap: String) -> void:
 	var d = JSON.parse_string(snap)
 	if typeof(d) != TYPE_ARRAY:
 		return
+	_bd_apply_missing_term_fallbacks(d)
 	_bd_shapes = d
 	_bd_reindex()
 	_bd_save_in = 0.4
@@ -7270,7 +7798,7 @@ func _bd_undo() -> void:
 	_bd_stop_edit()
 	if _bd_undo_stack.is_empty():
 		return
-	_bd_redo_stack.append(_bd_snapshot())
+	_bd_redo_stack.append(_bd_snapshot(true))
 	_bd_restore(_bd_undo_stack.pop_back())
 	_bd_ui_refresh()
 
@@ -7279,7 +7807,7 @@ func _bd_redo() -> void:
 	_bd_stop_edit()
 	if _bd_redo_stack.is_empty():
 		return
-	_bd_undo_stack.append(_bd_snapshot())
+	_bd_undo_stack.append(_bd_snapshot(true))
 	_bd_restore(_bd_redo_stack.pop_back())
 	_bd_ui_refresh()
 
@@ -7327,16 +7855,22 @@ func _bd_clone(ids: Array, offset: Vector2) -> Array:
 	var copies := []
 	for i in ids:
 		var c: Dictionary = _bd_by_id[i].duplicate(true)
-		if str(c["type"]) == "arrow":   # copies start where the original is drawn
+		var type := str(c["type"])
+		if type == "arrow":   # copies start where the original is drawn
 			var e := _bd_arrow_ends(_bd_by_id[i])
 			c["a"] = _bd_a(e[0])
 			c["b"] = _bd_a(e[1])
+		elif type == "line":
+			var e := _bd_pts(_bd_by_id[i])
+			if not e.is_empty():
+				_bd_set_line_end(c, "a", e[0])
+				_bd_set_line_end(c, "b", e[e.size() - 1])
 		copies.append(c)
 	return _bd_insert(copies, offset)
 
 
 # Add copies of shapes under fresh ids. Bindings and groups among the copies are
-# remapped to each other; arrows bound outside the set keep their ends.
+# remapped to each other; connectors bound outside the set keep their ends.
 func _bd_insert(copies: Array, offset: Vector2) -> Array:
 	var idmap := {}
 	for c in copies:
@@ -7351,13 +7885,13 @@ func _bd_insert(copies: Array, offset: Vector2) -> Array:
 			if not gmap.has(grp):
 				gmap[grp] = "g" + _bd_fresh_id()
 			s["group"] = gmap[grp]
-		if str(s["type"]) == "arrow":
+		if str(s["type"]) in ["arrow", "line"]:
 			for e in ["a", "b"]:
 				var key := str(s.get("bind_" + e, ""))
 				if idmap.has(key):
 					s["bind_" + e] = idmap[key]
 				elif key != "" and not key.begins_with("term"):
-					s["bind_" + e] = ""
+					_bd_clear_binding(s, e)
 		_bd_translate(s, s.duplicate(true), offset)
 		_bd_add(s)
 		out.append(s["id"])
@@ -7378,10 +7912,16 @@ func _bd_copy() -> void:
 	var copies := []
 	for i in _bd_sel:
 		var c: Dictionary = _bd_by_id[i].duplicate(true)
-		if str(c["type"]) == "arrow":
+		var type := str(c["type"])
+		if type == "arrow":
 			var e := _bd_arrow_ends(_bd_by_id[i])
 			c["a"] = _bd_a(e[0])
 			c["b"] = _bd_a(e[1])
+		elif type == "line":
+			var e := _bd_pts(_bd_by_id[i])
+			if not e.is_empty():
+				_bd_set_line_end(c, "a", e[0])
+				_bd_set_line_end(c, "b", e[e.size() - 1])
 		copies.append(c)
 	DisplayServer.clipboard_set(JSON.stringify({"cove-board": copies}))
 
@@ -7469,9 +8009,14 @@ func _bd_flip(horizontal: bool) -> void:
 	_bd_begin()
 	var c := _bd_sel_box().get_center()
 	var k := Vector2(-1, 1) if horizontal else Vector2(1, -1)
+	var targets := {}
+	for id in _bd_sel:
+		targets[id] = true
+	var binding_orig := _bd_binding_anchor_snapshot(targets)
 	for i in _bd_sel:
 		var s: Dictionary = _bd_by_id[i]
 		_bd_scale(s, s.duplicate(true), c, k)
+	_bd_apply_binding_scale(binding_orig, k)
 	_bd_commit()
 
 
@@ -7705,10 +8250,11 @@ func _bd_member_count(sid: String) -> int:
 # --- board: persistence ------------------------------------------------------------
 
 func _bd_save_now() -> void:
+	_bd_freeze_term_bindings(-1, false)
 	_bd_save_in = -1.0
 	# Termling bindings made before the ls poll learned a session get keyed by it now.
 	for s in _bd_shapes:
-		if str(s["type"]) != "arrow":
+		if not str(s["type"]) in ["arrow", "line"]:
 			continue
 		for e in ["a", "b"]:
 			var key := str(s.get("bind_" + e, ""))
