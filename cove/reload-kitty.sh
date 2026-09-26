@@ -110,13 +110,29 @@ with ThreadPoolExecutor(8) as ex:
 echo "saved $(ls "$DIR/scroll" 2>/dev/null | wc -l | tr -d ' ') termling screen(s)"
 
 # Stop Godot + kitty. The abduco masters (and the shells/agents they hold) keep
-# running, detached, so nothing inside the termlings is lost.
-pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/null || true
+# running, detached, so nothing inside the termlings is lost. Match --path as
+# an argument pair: Godot may have flags such as --max-fps before it.
+GODOT_PIDS="$(ps -Ao pid=,command= | APP_PATH="$APP" awk '
+    {
+        is_godot = 0; has_app_path = 0
+        for (i = 2; i <= NF; i++) {
+            if (tolower($i) ~ /(^|\/)godot$/) is_godot = 1
+            if ($i == "--path" && i < NF && $(i + 1) == ENVIRON["APP_PATH"]) has_app_path = 1
+        }
+        if (is_godot && has_app_path) print $1
+    }
+')"
+for _p in $GODOT_PIDS; do kill "$_p" 2>/dev/null || true; done
 # Wait for Godot to be gone before touching kitty: a Godot still running while
 # the frame files vanish and reappear under new ids re-places those termlings
 # and saves the wrong spots to state.json (seen 2026-09-25 under heavy load).
-for _ in $(seq 1 50); do pgrep -if "godot --path $APP" >/dev/null || break; sleep 0.1; done
-pkill -9 -if "godot --path $APP" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    _alive=0
+    for _p in $GODOT_PIDS; do kill -0 "$_p" 2>/dev/null && _alive=1; done
+    [ "$_alive" = 0 ] && break
+    sleep 0.1
+done
+for _p in $GODOT_PIDS; do kill -9 "$_p" 2>/dev/null || true; done
 # kitty.pid can outlive its kitty (a crash), and the pid be reused: only kill
 # it if it's still a Cove kitty.
 KPIDS="$(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}')"
