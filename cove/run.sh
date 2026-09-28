@@ -72,7 +72,7 @@ if "$KITTEN" @ --to "$SOCK" ls >/dev/null 2>&1; then
     echo "kitty is still running at $SOCK; relaunching Godot"
     exec 9>&-
     "$REPO/cove/cove-remote-start.sh" || true
-    exec "$GODOT" --path "$REPO/cove"
+	exec "$GODOT" --path "$REPO/cove" --max-fps 60
 fi
 
 # A cove kitty that is alive but not answering (hung, or its socket was
@@ -137,6 +137,7 @@ fi
     -o allow_remote_control=yes \
     -o macos_quit_when_last_window_closed=yes \
     -o sync_to_monitor=no \
+    -o repaint_delay=16 \
     -o font_size=16 \
     -o remember_window_size=no -o initial_window_width=110c -o initial_window_height=32c \
     -o "map cmd+n cove_new_os_window" \
@@ -195,4 +196,4 @@ exec 9>&-
 # Auto-start remote termlings (relay + peer auto-viewer) before the Godot host.
 "$REPO/cove/cove-remote-start.sh" || true
 
-"$GODOT" --path "$REPO/cove"
+"$GODOT" --path "$REPO/cove" --max-fps 60

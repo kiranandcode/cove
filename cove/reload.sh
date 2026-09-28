@@ -31,5 +31,5 @@ fi
 pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/null || true
 sleep 0.4
 COVE_KITTEN="$COVE_KITTEN" COVE_KITTY_SOCKET="$COVE_KITTY_SOCKET" \
-    nohup "$GODOT" --path "$APP" >/tmp/cove-godot.log 2>&1 &
+	nohup "$GODOT" --path "$APP" --max-fps 60 >/tmp/cove-godot.log 2>&1 &
 echo "reloaded Godot ($!) — terminals + positions preserved."

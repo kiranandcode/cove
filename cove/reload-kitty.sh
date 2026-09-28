@@ -181,7 +181,7 @@ rm -f /tmp/cove-kitty 2>/dev/null || true
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
 
 COMMON=(--title cove --listen-on "$SOCK"
-    -o allow_remote_control=yes -o sync_to_monitor=no -o font_size=16
+    -o allow_remote_control=yes -o sync_to_monitor=no -o repaint_delay=16 -o font_size=16
     -o remember_window_size=no -o initial_window_width=110c -o initial_window_height=32c
     -o "map cmd+n cove_new_os_window"
     -o shell="$WRAPPER")
@@ -278,7 +278,7 @@ done
 # Refresh dev-env (new pid) and relaunch Godot.
 write_dev_env "$COVE_KITTY_PID"
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
-    nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
+	nohup "$GODOT" --path "$APP" --max-fps 60 9>&- >/tmp/cove-godot.log 2>&1 &
 STARTUP_COMPLETE=true
 exec 9>&-
 echo "warm reload done: kitty restarted (new code), ${#SESSIONS[@]} termling(s) reattached."

@@ -587,7 +587,8 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 (root / 'kitty-iosurface').read_text(),
                 '1' if resolved == '1' else '<unset>',
             )
-            self.assertEqual((root / 'godot-args').read_text().strip(), f'--path {repo / "cove"}')
+            self.assertEqual((root / 'godot-args').read_text().strip(),
+                             f'--path {repo / "cove"} --max-fps 60')
             self.assertTrue(kitty_exited.exists())
 
     def test_reload_recovers_after_old_kitty_detaches(self) -> None:

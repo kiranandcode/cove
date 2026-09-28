@@ -9,11 +9,9 @@ config/name="Cove"
 run/main_scene="res://scenes/main.tscn"
 config/icon="res://branding/cove-icon-1024.png"
 config/features=PackedStringArray("4.6")
-# Render (and so re-sample each terminal's shared frame file) well above the
-# monitor refresh, so a freshly-published kitty frame is picked up in ~a few ms
-# instead of waiting up to a full 60Hz frame. Cheap: the scene is a handful of
-# sprites. Capped so we don't pin a core.
-run/max_fps=144
+; Match kitty's Cove repaint cadence. The board and terminal upload paths are no
+; longer cheap enough to run uncapped, and 60 Hz still keeps input responsive.
+run/max_fps=60
 
 [display]
 
@@ -22,7 +20,7 @@ window/size/viewport_height=800
 window/size/resizable=true
 window/stretch/mode="disabled"
 window/stretch/aspect="expand"
-# Mailbox present: always show the newest rendered frame with no multi-frame
-# vsync queue, and no tearing. This is the main win for typing latency — the
-# default (Enabled/FIFO) queues 2-3 frames on macOS before they reach the glass.
+; Mailbox present: always show the newest rendered frame with no multi-frame
+; vsync queue, and no tearing. This is the main win for typing latency: the
+; default (Enabled/FIFO) queues 2-3 frames on macOS before they reach the glass.
 window/vsync/vsync_mode=3

@@ -86,6 +86,7 @@ export COVE=1
 WRAPPER="$APP/cove-shell.sh"
 KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     --listen-on "$SOCK" -o allow_remote_control=yes -o sync_to_monitor=no \
+    -o repaint_delay=16 \
     -o font_size=16 -o remember_window_size=no \
     -o initial_window_width=110c -o initial_window_height=32c \
     -o "map cmd+n cove_new_os_window" \
@@ -142,7 +143,7 @@ echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
 "$APP/cove-remote-start.sh" 9>&- || true
 
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
-    nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
+	nohup "$GODOT" --path "$APP" --max-fps 60 9>&- >/tmp/cove-godot.log 2>&1 &
 trap - EXIT HUP INT TERM
 exec 9>&-
 echo "Cove dev up (kitty + godot). Edit scripts, then: cove/reload.sh"
