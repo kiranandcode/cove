@@ -4,7 +4,10 @@
 # the Godot host that displays it and forwards input. See cove/README.md.
 set -euo pipefail
 
+_COVE_IOSURFACE_OVERRIDE_SET=${COVE_IOSURFACE+x}
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP="$REPO/cove"
 KITTY="$REPO/kitty/launcher/kitty"
 KITTEN="$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten"
 SOCK="unix:/tmp/cove-kitty"
@@ -36,6 +39,11 @@ if [ ! -x "$ABDUCO" ]; then
     echo "abduco not found at $ABDUCO" >&2
     exit 1
 fi
+# Reject a malformed transport request before touching saved state. The class
+# probe itself waits until we know this launch will actually restart kitty.
+# shellcheck disable=SC1091
+source "$APP/cove-iosurface.sh"
+cove_normalize_iosurface
 # Pids of processes whose command line starts with "$1 " (or is exactly $1),
 # case-insensitively (Godot runs as .../Godot.app/Contents/MacOS/Godot). The
 # pattern goes in through the environment so awk's own argv can't match it.
@@ -57,6 +65,9 @@ if "$KITTEN" @ --to "$SOCK" ls >/dev/null 2>&1; then
     if [ -n "$(pids_running "godot --path $REPO/cove")" ]; then
         echo "Cove is already running at $SOCK" >&2
         exit 1
+    fi
+    if [ "$_COVE_IOSURFACE_OVERRIDE_SET" = x ]; then
+        echo "warning: kitty is already running; its IOSurface mode is unchanged. Restart kitty to apply COVE_IOSURFACE=${COVE_IOSURFACE} (cove/reload-kitty.sh in dev mode)." >&2
     fi
     echo "kitty is still running at $SOCK; relaunching Godot"
     exec 9>&-
@@ -108,15 +119,9 @@ export KITTY_COVE_DIR="$DIR"
 # as living in the cove; its terminal id is kitty's own $KITTY_WINDOW_ID.
 export COVE=1
 
-# Opt into the zero-copy IOSurface transport with COVE_IOSURFACE=1. Needs
-# the gdext/ extension built + registered (see cove/README.md). We make sure
-# it's registered by running a one-time headless import if needed.
-if [ "${COVE_IOSURFACE:-}" = "1" ]; then
-    export KITTY_COVE_IOSURFACE=1
-    if [ ! -f "$REPO/cove/.godot/extension_list.cfg" ]; then
-        "$GODOT" --path "$REPO/cove" --editor --headless --quit >/dev/null 2>&1 || true
-    fi
-fi
+# COVE_IOSURFACE is an opt-in request. Kitty's internal presence-only flag is
+# set only after Godot confirms that it can import the corresponding class.
+cove_probe_iosurface
 
 # The kitty window is created hidden (cove mode); only Godot is visible.
 # sync_to_monitor=no lets the hidden window keep rendering without a display link.

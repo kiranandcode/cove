@@ -4,10 +4,16 @@
 # camera from state.json. Run after editing scripts. Requires dev.sh first.
 set -euo pipefail
 
+_COVE_IOSURFACE_OVERRIDE_SET=${COVE_IOSURFACE+x}
+_COVE_IOSURFACE_OVERRIDE=${COVE_IOSURFACE-}
+
 DIR="/tmp/cove"
 [ -f "$DIR/dev-env" ] || { echo "Not in dev mode (no $DIR/dev-env). Start with cove/dev.sh." >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$DIR/dev-env"
+if [ "$_COVE_IOSURFACE_OVERRIDE_SET" = x ]; then
+    COVE_IOSURFACE=$_COVE_IOSURFACE_OVERRIDE
+fi
 
 # Is the cove-kitty still alive? Prefer the pid file dev.sh wrote; fall back to
 # scanning ps (macOS `pgrep -f` can't read kitty's args, so it never matches).

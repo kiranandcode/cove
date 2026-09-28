@@ -27,6 +27,9 @@ class RunRecoveryTest(unittest.TestCase):
         self, sessions: list[str], *, attached: list[str] = (),
         lock_held: bool = False, kitty_alive: bool = False,
         godot_alive: bool = False, stuck_kitty: bool = False,
+        iosurface: str | None = None, probe_ok: bool = True,
+        inherited_kitty_iosurface: bool = False,
+        extension_registered: bool = True,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory(prefix='cove-run-test-')
         self.addCleanup(temp.cleanup)
@@ -39,14 +42,24 @@ class RunRecoveryTest(unittest.TestCase):
         source = (REPO_ROOT / 'cove' / 'run.sh').read_text().replace('/tmp/cove', str(runtime))
         launcher = repo / 'cove' / 'run.sh'
         self.write_executable(launcher, source)
-        (repo / 'cove' / '.godot').mkdir(parents=True)
-        (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
+        self.write_executable(
+            repo / 'cove' / 'cove-iosurface.sh',
+            (REPO_ROOT / 'cove' / 'cove-iosurface.sh').read_text(),
+        )
+        probe = repo / 'cove' / 'scripts' / 'IOSurfaceProbe.gd'
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text((REPO_ROOT / 'cove' / 'scripts' / 'IOSurfaceProbe.gd').read_text())
+        extension_list = repo / 'cove' / '.godot' / 'extension_list.cfg'
+        if extension_registered:
+            extension_list.parent.mkdir(parents=True)
+            extension_list.write_text('res://cove.gdextension\n')
 
         kitty = repo / 'kitty' / 'launcher' / 'kitty'
         self.write_executable(
             kitty,
             '#!/bin/sh\n'
             'printf "%s\\n" "$@" > "$KITTY_ARGS"\n'
+            'printf "%s" "${KITTY_COVE_IOSURFACE-<unset>}" > "$KITTY_IOSURFACE"\n'
             'mkdir -p "$KITTY_COVE_DIR"\n'
             ': > "$KITTY_COVE_DIR/term-9.rgba"\n'
             ': > "$KITTY_READY"\n'
@@ -70,7 +83,18 @@ class RunRecoveryTest(unittest.TestCase):
         self.write_executable(repo / 'cove' / 'cove-shell.sh', '#!/bin/sh\nexit 0\n')
         self.write_executable(repo / 'cove' / 'cove-remote-start.sh', '#!/bin/sh\nexit 0\n')
         godot = fake_bin / 'godot'
-        self.write_executable(godot, '#!/bin/sh\n: > "$GODOT_DONE"\n')
+        self.write_executable(
+            godot,
+            '#!/bin/sh\n'
+            'case " $* " in\n'
+            '  *" --editor "*) mkdir -p "$(dirname "$EXTENSION_LIST")"; '
+            'printf "%s\\n" res://cove.gdextension > "$EXTENSION_LIST"; : > "$IMPORT_CALLED"; exit 0 ;;\n'
+            '  *" --script res://scripts/IOSurfaceProbe.gd "*) : > "$PROBE_CALLED"; '
+            '[ "$PROBE_OK" = 1 ] && echo COVE_IOSURFACE_PROBE=1; exit 0 ;;\n'
+            '  *" --script "*) exit 0 ;;\n'
+            'esac\n'
+            ': > "$GODOT_DONE"\n',
+        )
 
         runtime.mkdir(parents=True)
         (runtime / 'state.json').write_text('saved-layout\n')
@@ -89,14 +113,23 @@ class RunRecoveryTest(unittest.TestCase):
             'ABDUCO_LIST': str(root / 'abduco-list'),
             'GODOT': str(godot),
             'GODOT_DONE': str(root / 'godot-done'),
+            'EXTENSION_LIST': str(extension_list),
             'HOME': str(root / 'home'),
+            'IMPORT_CALLED': str(root / 'import-called'),
             'KITTY_ARGS': str(root / 'kitty-args'),
+            'KITTY_IOSURFACE': str(root / 'kitty-iosurface'),
             'KITTY_READY': str(root / 'kitty-ready'),
             'LAUNCH_ARGS': str(root / 'launch-args'),
             'PATH': f'{fake_bin}:/usr/bin:/bin',
+            'PROBE_CALLED': str(root / 'probe-called'),
+            'PROBE_OK': '1' if probe_ok else '0',
             'RESIZE_ARGS': str(root / 'resize-args'),
             'SHELL': '/bin/zsh',
         }
+        if iosurface is not None:
+            env['COVE_IOSURFACE'] = iosurface
+        if inherited_kitty_iosurface:
+            env['KITTY_COVE_IOSURFACE'] = '1'
         if kitty_alive:
             (root / 'kitty-ready').write_text('')
         if godot_alive:
@@ -197,6 +230,14 @@ class RunRecoveryTest(unittest.TestCase):
         self.assertFalse((root / 'kitty-args').exists())
         self.assertEqual((runtime / 'kitty.pid').read_text(), 'stale\n')
 
+    def test_live_kitty_reports_that_transport_changes_need_a_restart(self) -> None:
+        result, root = self.run_launcher(['cove-111'], kitty_alive=True, iosurface='1')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('IOSurface mode is unchanged', result.stderr)
+        self.assertIn('cove/reload-kitty.sh', result.stderr)
+        self.assertFalse((root / 'probe-called').exists())
+
     def test_live_kitty_and_godot_is_rejected(self) -> None:
         result, root = self.run_launcher([], kitty_alive=True, godot_alive=True)
 
@@ -212,6 +253,49 @@ class RunRecoveryTest(unittest.TestCase):
         self.assertIn('not answering', result.stderr)
         self.assertFalse((root / 'kitty-args').exists())
         self.assertEqual((runtime / 'kitty.pid').read_text(), 'stale\n')
+
+    def test_iosurface_mode_requires_a_successful_class_probe(self) -> None:
+        result, root = self.run_launcher([], iosurface='1')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / 'kitty-iosurface').read_text(), '1')
+        self.assertTrue((root / 'probe-called').exists())
+
+    def test_iosurface_mode_imports_before_the_first_class_probe(self) -> None:
+        result, root = self.run_launcher(
+            [], iosurface='1', extension_registered=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / 'kitty-iosurface').read_text(), '1')
+        self.assertTrue((root / 'import-called').exists())
+        self.assertTrue((root / 'probe-called').exists())
+
+    def test_iosurface_mode_falls_back_when_the_class_probe_fails(self) -> None:
+        result, root = self.run_launcher([], iosurface='1', probe_ok=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / 'kitty-iosurface').read_text(), '<unset>')
+        self.assertIn('CoveIOSurface is unavailable', result.stderr)
+
+    def test_explicit_zero_clears_an_inherited_kitty_flag(self) -> None:
+        result, root = self.run_launcher(
+            [], iosurface='0', inherited_kitty_iosurface=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / 'kitty-iosurface').read_text(), '<unset>')
+        self.assertFalse((root / 'probe-called').exists())
+
+    def test_invalid_iosurface_mode_is_rejected_before_kitty_starts(self) -> None:
+        result, root = self.run_launcher([], iosurface='yes')
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('COVE_IOSURFACE must be 0 or 1', result.stderr)
+        self.assertFalse((root / 'kitty-args').exists())
+        runtime = root / 'runtime' / 'cove'
+        self.assertEqual((runtime / 'state.json').read_text(), 'saved-layout\n')
+        self.assertEqual((runtime / 'term-1000000.rgba').read_text(), 'app-frame\n')
 
 
 if __name__ == '__main__':

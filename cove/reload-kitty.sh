@@ -10,10 +10,16 @@
 # kitty running and only relaunches Godot.
 set -euo pipefail
 
+_COVE_IOSURFACE_OVERRIDE_SET=${COVE_IOSURFACE+x}
+_COVE_IOSURFACE_OVERRIDE=${COVE_IOSURFACE-}
+
 DIR="/tmp/cove"
 [ -f "$DIR/dev-env" ] || { echo "Not in dev mode (no $DIR/dev-env). Start with cove/dev.sh." >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$DIR/dev-env"
+if [ "$_COVE_IOSURFACE_OVERRIDE_SET" = x ]; then
+    COVE_IOSURFACE=$_COVE_IOSURFACE_OVERRIDE
+fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KITTY="$REPO/kitty/launcher/kitty"
@@ -23,6 +29,8 @@ REATTACH="$REPO/cove/cove-reattach.sh"   # prints the saved screen, then abduco 
 SOCK="${COVE_KITTY_SOCKET:-unix:/tmp/cove-kitty}"
 ABDUCO="$REPO/cove/bin/abduco"   # patched: no alt screen (build-abduco.sh)
 [ -x "$ABDUCO" ] || ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
+# shellcheck disable=SC1091
+source "$REPO/cove/cove-iosurface.sh"
 
 LOCK_FILE="/tmp/cove-launch.lock"
 COVE_KITTY_PID=""
@@ -37,6 +45,7 @@ write_dev_env() {
         echo "COVE_KITTY_SOCKET=$SOCK"
         echo "APP=$APP"
         echo "GODOT=$GODOT"
+        cove_write_iosurface_env
         [ -z "${1:-}" ] || echo "COVE_KITTY_PID=$1"
     } > "$DIR/dev-env.new"
     mv "$DIR/dev-env.new" "$DIR/dev-env"
@@ -78,6 +87,7 @@ if ! "$ABDUCO" >/dev/null 2>&1; then
     echo "failed to list abduco sessions" >&2
     exit 1
 fi
+cove_resolve_iosurface
 
 # Save each termling's screen + scrollback (with colours) while this kitty still
 # has it: abduco keeps the processes, not the screen, so without this every
@@ -169,7 +179,6 @@ done
 rm -f /tmp/cove-kitty 2>/dev/null || true
 
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
-[ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
 
 COMMON=(--title cove --listen-on "$SOCK"
     -o allow_remote_control=yes -o sync_to_monitor=no -o font_size=16

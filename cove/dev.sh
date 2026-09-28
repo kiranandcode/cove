@@ -5,6 +5,8 @@
 # positions/names/camera from state.json. `stop.sh` quits everything.
 set -euo pipefail
 
+_COVE_IOSURFACE_OVERRIDE_SET=${COVE_IOSURFACE+x}
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$REPO/cove"
 KITTY="$REPO/kitty/launcher/kitty"
@@ -32,21 +34,34 @@ if ! session_listing=$("$ABDUCO" 2>/dev/null); then
 fi
 SESSIONS=($(printf '%s\n' "$session_listing" | awk 'NR>1 && $1 != "+"{print $NF}' | grep -E '^cove-[0-9]+$' || true))
 
+# An explicit setting wins. Otherwise a warm restart keeps the request recorded
+# by the previous dev launch instead of silently falling back to CPU readback.
+if [ "$_COVE_IOSURFACE_OVERRIDE_SET" != x ] && [ "${#SESSIONS[@]}" -ne 0 ] \
+        && [ -f "$DIR/dev-env" ]; then
+    while IFS='=' read -r _key _value; do
+        [ "$_key" = COVE_IOSURFACE ] && COVE_IOSURFACE=$_value
+    done < "$DIR/dev-env"
+fi
+# shellcheck disable=SC1091
+source "$APP/cove-iosurface.sh"
+
 # The GDExtension (CoveInput/IOSurface) must be registered for fast input.
 if [ ! -f "$APP/.godot/extension_list.cfg" ]; then
     "$GODOT" --path "$APP" --editor --headless --quit >/dev/null 2>&1 || true
 fi
+cove_resolve_iosurface
 
 # Reuse the warm-restart path when a crashed or running Cove already owns
 # sessions. It preserves layout and reattaches them instead of wiping /tmp/cove.
 if [ "${#SESSIONS[@]}" -ne 0 ]; then
     mkdir -p "$DIR"
-    cat > "$DIR/dev-env.new" <<EOF
-COVE_KITTEN=$KITTEN
-COVE_KITTY_SOCKET=$SOCK
-APP=$APP
-GODOT=$GODOT
-EOF
+    {
+        echo "COVE_KITTEN=$KITTEN"
+        echo "COVE_KITTY_SOCKET=$SOCK"
+        echo "APP=$APP"
+        echo "GODOT=$GODOT"
+        cove_write_iosurface_env
+    } > "$DIR/dev-env.new"
     mv "$DIR/dev-env.new" "$DIR/dev-env"
     COVE_LAUNCH_LOCK_HELD=1 "$APP/reload-kitty.sh"
     "$APP/cove-remote-start.sh" 9>&- || true
@@ -65,7 +80,6 @@ sleep 0.5
 rm -rf "$DIR"; rm -f /tmp/cove-kitty
 
 export COVE=1
-[ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
 # Each terminal runs cove-shell.sh, which wraps the shell in an abduco session so
 # it survives a kitty restart (see reload-kitty.sh). -o shell= makes Cmd+N windows
 # use it too. abduco is a transparent passthrough, so rendering is unchanged.
@@ -115,13 +129,14 @@ fi
 # Record the kitty pid so reload.sh/stop.sh find it without pgrep (which can't
 # read kitty's args on macOS).
 echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
-cat > "$DIR/dev-env" <<EOF
-COVE_KITTEN=$KITTEN
-COVE_KITTY_SOCKET=$SOCK
-APP=$APP
-GODOT=$GODOT
-COVE_KITTY_PID=$COVE_KITTY_PID
-EOF
+{
+    echo "COVE_KITTEN=$KITTEN"
+    echo "COVE_KITTY_SOCKET=$SOCK"
+    echo "APP=$APP"
+    echo "GODOT=$GODOT"
+    cove_write_iosurface_env
+    echo "COVE_KITTY_PID=$COVE_KITTY_PID"
+} > "$DIR/dev-env"
 
 # Auto-start remote termlings (relay + peer auto-viewer) — survives Godot reloads.
 "$APP/cove-remote-start.sh" 9>&- || true
