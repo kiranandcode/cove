@@ -5035,6 +5035,7 @@ var _bd_guides: Array = []      # [[from, to]] snap guide lines for the overlay
 var _bd_rot_center := Vector2.ZERO
 var _bd_rot_start := 0.0
 var _bd_tex := {}               # image src -> Texture2D (null if it failed to load)
+var _bd_tex_active := {}        # sources used by the complete board draw in progress
 var _bd_last_input_ms := 0      # last board click/key, for _bd_owns_keyboard
 # Redraw on change, not every frame (see _bd_tick).
 var _bd_live_layer: Node2D      # arrows tied to termlings, which move on their own
@@ -5229,6 +5230,7 @@ func _bd_reindex() -> void:
 		_bd_by_id[str(s["id"])] = s
 		if str(s["type"]) == "bookmark":
 			_bd_bm_apply(s)   # undo and reloads pick up what's been unfurled since
+	_bd_prune_textures()
 	_bd_sel = _bd_sel.filter(func(i): return _bd_by_id.has(i))
 	_cal_apply_all()
 
@@ -6599,6 +6601,8 @@ func _bd_todo_part_at(s: Dictionary, p: Vector2) -> Dictionary:
 func _bd_draw() -> void:
 	if _cam == null:
 		return
+	_bd_texture_draw_begin()
+	_fs_thumb_draw_begin()
 	_bd_drawn_area = _bd_view_area(0.5)
 	_bd_dz = _bd_detail_zoom()
 	var pad := 48.0 + _bd_frame_px() * 2.0   # strokes, shadows, frame titles above
@@ -6609,6 +6613,8 @@ func _bd_draw() -> void:
 		if str(s["type"]) != "frame" and not _bd_is_live(s) and _bd_shown(s) \
 				and _bd_drawn_area.intersects(_bd_bounds(s).grow(pad)):
 			_bd_draw_shape(_bd_layer, s)
+	_bd_texture_draw_end()
+	_fs_thumb_draw_end()
 
 
 # Zoomed out, detail below a pixel or so is skipped: sketchy wobble, hatching,
@@ -8702,6 +8708,7 @@ func _bd_add_image(img: Image, at: Vector2) -> String:
 func _bd_texture(src: String):
 	if src == "":
 		return null
+	_bd_tex_active[src] = true
 	if not _bd_tex.has(src):
 		var tex = null
 		if FileAccess.file_exists(src):
@@ -8711,6 +8718,38 @@ func _bd_texture(src: String):
 				tex = ImageTexture.create_from_image(img)
 		_bd_tex[src] = tex
 	return _bd_tex[src]
+
+
+# Keep decoded board images only for shapes in the current drawing region. A
+# pan reloads newly visible images once, then keeps them until they leave it.
+func _bd_texture_draw_begin() -> void:
+	_bd_tex_active.clear()
+
+
+func _bd_texture_draw_end() -> void:
+	for src in _bd_tex.keys():
+		if not _bd_tex_active.has(src):
+			_bd_tex.erase(src)
+
+
+# Shape changes can release stale textures immediately instead of waiting for
+# the next board draw. This also covers deleted images cached as failed loads.
+func _bd_prune_textures() -> void:
+	var keep := {}
+	for s in _bd_shapes:
+		match str(s["type"]):
+			"image":
+				var src := str(s.get("src", ""))
+				if src != "":
+					keep[src] = true
+			"bookmark":
+				for field in ["image", "favicon"]:
+					var src := str(s.get(field, ""))
+					if src != "":
+						keep[src] = true
+	for src in _bd_tex.keys():
+		if not keep.has(src):
+			_bd_tex.erase(src)
 
 
 func _bd_draw_image(ci: CanvasItem, s: Dictionary) -> void:
@@ -8881,6 +8920,7 @@ func _bd_unfurl_poll() -> void:
 		for s in _bd_shapes:
 			if str(s["type"]) == "bookmark" and str(s.get("url", "")) == url:
 				_bd_bm_apply(s)
+		_bd_prune_textures()
 		_bd_dirty = true
 		_bd_save_in = 0.4
 
@@ -10236,6 +10276,7 @@ const FS_TILE := Vector2(92, 88)
 const FS_MAX := 400             # entries listed per folder
 const FS_RELIST_MS := 2000
 const FS_CHANGES_MS := 5000
+const FS_THUMB_CACHE_MAX := 128
 const FS_FILE_W := 250.0
 const FS_FILE_H := 48.0
 const FS_FOLDER_COL := Color(0.42, 0.62, 0.92)
@@ -10248,7 +10289,10 @@ const FS_ST_NAME := {"M": "modified", "A": "added", "??": "new", "D": "deleted",
 var _fs_cache := {}      # dir -> {entries, more, mtime, checked, used}
 var _fs_changes := {}    # root -> {files, dirs, top, at}
 var _fs_fetch := {}      # out path -> {root, t}
-var _fs_thumbs := {}     # image path -> Texture2D (or null: couldn't load)
+var _fs_thumbs := {}     # bounded LRU, except all thumbnails active in one draw stay resident
+var _fs_thumb_used := {} # image path -> monotonically increasing access number
+var _fs_thumb_active := {} # thumbnails used by the board draw in progress
+var _fs_thumb_clock := 0
 var _fs_thumb_budget := 0
 var _fs_drag := {}       # {id, path, dir, toggle} while an entry is pressed/dragged
 var _fs_active := ""     # the folder frame whose contents were last clicked (it gets the keys)
@@ -11360,6 +11404,7 @@ func _fs_ext_col(ext: String) -> Color:
 
 func _fs_thumb(path: String):
 	if _fs_thumbs.has(path):
+		_fs_thumb_touch(path)
 		return _fs_thumbs[path]
 	if _fs_thumb_budget <= 0:
 		_bd_dirty = true   # more next frame
@@ -11376,7 +11421,37 @@ func _fs_thumb(path: String):
 				img.resize(maxi(1, int(img.get_width() * 192.0 / m)), maxi(1, int(img.get_height() * 192.0 / m)))
 			tex = ImageTexture.create_from_image(img)
 	_fs_thumbs[path] = tex
+	_fs_thumb_touch(path)
 	return tex
+
+
+func _fs_thumb_touch(path: String) -> void:
+	_fs_thumb_clock += 1
+	_fs_thumb_used[path] = _fs_thumb_clock
+	_fs_thumb_active[path] = true
+
+
+func _fs_thumb_draw_begin() -> void:
+	_fs_thumb_active.clear()
+
+
+func _fs_thumb_draw_end() -> void:
+	if _fs_thumbs.size() <= FS_THUMB_CACHE_MAX:
+		return
+	var old := []
+	for path in _fs_thumbs:
+		if not _fs_thumb_active.has(path):
+			old.append([int(_fs_thumb_used.get(path, 0)), str(path)])
+	old.sort_custom(func(a, b):
+		return int(a[0]) < int(b[0]) if int(a[0]) != int(b[0]) else str(a[1]) < str(b[1]))
+	var remove := _fs_thumbs.size() - FS_THUMB_CACHE_MAX
+	for item in old:
+		if remove <= 0:
+			break
+		var path: String = item[1]
+		_fs_thumbs.erase(path)
+		_fs_thumb_used.erase(path)
+		remove -= 1
 
 
 func _fs_glyph(ci: CanvasItem, r: Rect2, it: Dictionary, a: float) -> void:
