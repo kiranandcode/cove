@@ -119,6 +119,7 @@ var _bg_pids := {}            # agent pids we put in Darwin background (see _app
 var _bg_focus_seen := -2      # _focused_id the policy last ran for
 var _state_rename_dir: DirAccess   # that task's own DirAccess
 var _ls_run := true
+const CWD_SCAN_INTERVAL_MSEC := 5000
 var _child_mutex := Mutex.new()
 var _child_pids: Array[int] = []
 var _state_accum := 0.0
@@ -2104,6 +2105,9 @@ func _start_ls_poll() -> void:
 
 func _ls_loop() -> void:
 	var watchdog_tick := 0
+	var last_cwd_scan_msec := -1
+	var cwd_cache := {}
+	var sess_info := {}
 	while _ls_run:
 		# Every ~30s, run the session watchdog: it detects (and heals) abduco
 		# attach clients spinning at 100% cpu and deadlocked session ptys, both
@@ -2116,10 +2120,30 @@ func _ls_loop() -> void:
 		var out := []
 		OS.execute(kitten_exe, ["@", "--to", kitty_socket, "ls"], out, false)
 		var txt: String = out[0] if out.size() > 0 else ""
+		# Agent/idle/tool state is safety-sensitive and stays at one-second latency.
+		# lsof supplies only cwd data and dominates this poll's cost, so cache it.
 		var pout := []
-		OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
+		var ps_status := OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
 		var ptxt: String = pout[0] if pout.size() > 0 else ""
-		var sess_info := _scan_sessions(ptxt)
+		if ps_status == 0 and not ptxt.is_empty():
+			sess_info = _scan_sessions(ptxt, cwd_cache)
+			var now_msec := Time.get_ticks_msec()
+			if _cwd_scan_due(now_msec, last_cwd_scan_msec):
+				var pids := []
+				for sess in sess_info:
+					if int(sess_info[sess]["pid"]) > 0:
+						pids.append(int(sess_info[sess]["pid"]))
+				var fresh_cwds = _cwds_of(pids)
+				if fresh_cwds != null:
+					cwd_cache = {}
+					for sess in sess_info:
+						var pid := int(sess_info[sess]["pid"])
+						if fresh_cwds.has(pid):
+							cwd_cache[sess] = fresh_cwds[pid]
+					sess_info = _scan_sessions(ptxt, cwd_cache)
+					last_cwd_scan_msec = Time.get_ticks_msec()
+		else:
+			sess_info = {}
 		var data := _parse_ls(txt, sess_info)
 		_ls_mutex.lock()
 		_ls_data = data
@@ -2128,11 +2152,16 @@ func _ls_loop() -> void:
 		OS.delay_msec(1000)
 
 
+static func _cwd_scan_due(now_msec: int, last_scan_msec: int) -> bool:
+	return last_scan_msec < 0 or now_msec - last_scan_msec >= CWD_SCAN_INTERVAL_MSEC
+
+
 # Each termling's shell runs inside an abduco session (see cove-shell.sh) so it
 # survives a kitty restart. The shell/agent is then a child of the abduco master,
 # not of the kitty window, so `kitten @ ls` can't see it -- we recover the agent
-# and cwd by walking the process tree from each abduco master instead.
-func _scan_sessions(ptxt: String) -> Dictionary:
+# by walking the process tree from each abduco master instead. Cwds come from the
+# separately throttled session -> cwd cache; idle, agent, tool and activity stay fresh.
+func _scan_sessions(ptxt: String, cwds: Dictionary = {}) -> Dictionary:
 	var cmd := {}    # pid -> command
 	var kids := {}   # ppid -> [pid]
 	for raw in ptxt.split("\n", false):
@@ -2205,15 +2234,8 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 			res[sess]["act"] = _read_activity(sess)
 		if remote_link:
 			remote_sess.append(sess)
-	# One lsof for every session, not one per session: under load each spawn can
-	# take many seconds, and ~60 of them serially kept sessions unlearned for minutes.
-	var pids := []
 	for sess in res:
-		if int(res[sess]["pid"]) > 0:
-			pids.append(int(res[sess]["pid"]))
-	var cwds := _cwds_of(pids)
-	for sess in res:
-		res[sess]["cwd"] = str(cwds.get(int(res[sess]["pid"]), ""))
+		res[sess]["cwd"] = str(cwds.get(sess, ""))
 	for sess in remote_sess:
 		_apply_remote_link(res[sess], sess)
 	return res
@@ -2283,7 +2305,7 @@ func _session_token(c: String) -> String:
 
 
 # pid -> cwd for many pids in a single lsof call (`p<pid>` then `n<path>` lines).
-func _cwds_of(pids: Array) -> Dictionary:
+func _cwds_of(pids: Array):
 	var res := {}
 	if pids.is_empty():
 		return res
@@ -2291,7 +2313,9 @@ func _cwds_of(pids: Array) -> Dictionary:
 	for pid in pids:
 		ids.append(str(pid))
 	var out := []
-	OS.execute("/usr/sbin/lsof", ["-a", "-p", ",".join(ids), "-d", "cwd", "-Fn"], out, false)
+	var status := OS.execute("/usr/sbin/lsof", ["-a", "-p", ",".join(ids), "-d", "cwd", "-Fn"], out, false)
+	if status != 0:
+		return null
 	var txt: String = out[0] if out.size() > 0 else ""
 	var cur := -1
 	for line in txt.split("\n", false):
@@ -10875,8 +10899,6 @@ func _fs_cd(id: int, dir: String) -> bool:
 	var info: Dictionary = _agents.get(pane, {})
 	if pane == 0 or str(info.get("agent", "shell")) != "shell" or not bool(info.get("idle", false)):
 		return false
-	if str(info.get("cwd", "")) == dir:
-		return true
 	_pty(pane, ("cd " + _fs_quote(dir) + "\r").to_utf8_buffer())
 	return true
 
