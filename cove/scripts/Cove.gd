@@ -504,15 +504,15 @@ func _process(delta: float) -> void:
 # --- terminal discovery -----------------------------------------------------
 
 # kitty MSG_SUSPEND (6): [kind u8][os-window id u64 LE][on u8]. See TermCritter.
-func _send_suspend(on: bool, id: int) -> void:
+func _send_suspend(on: bool, id: int) -> bool:
 	if _sock == null or not _sock.has_method("send_raw") or not _sock.call("is_connected"):
-		return
+		return false
 	var msg := PackedByteArray()
 	msg.resize(10)
 	msg[0] = 6
 	msg.encode_u64(1, id)
 	msg[9] = 1 if on else 0
-	_sock.call("send_raw", msg)
+	return bool(_sock.call("send_raw", msg))
 
 
 func _reconcile() -> void:
