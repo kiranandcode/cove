@@ -397,11 +397,10 @@ def _wait_for_pane(pane, session, zone, timeout=15.0):
     return last
 
 
-def _pids_of_session(sess):
+def _session_processes(ptxt, sess):
     """(abduco master pid, [descendant pids]) for an abduco session."""
-    out = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
     procs, kids = {}, {}
-    for line in out.splitlines():
+    for line in ptxt.splitlines():
         sp = line.split(None, 2)
         if len(sp) < 3:
             continue
@@ -409,14 +408,25 @@ def _pids_of_session(sess):
         procs[pid] = sp[2]
         kids.setdefault(ppid, []).append(pid)
     for pid, cmd in procs.items():
-        if "abduco" in cmd and re.search(r"(^|\s)%s(\s|$)" % re.escape(sess), cmd) and kids.get(pid):
-            desc, q = [], list(kids[pid])
-            while q:
-                c = q.pop()
-                desc.append(c)
-                q.extend(kids.get(c, []))
-            return pid, desc
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            continue
+        owns_session = len(argv) >= 3 and argv[1] in ("-A", "-a") and argv[2] == sess
+        if not argv or os.path.basename(argv[0]) != "abduco" or not owns_session or not kids.get(pid):
+            continue
+        desc, q = [], list(kids[pid])
+        while q:
+            c = q.pop()
+            desc.append(c)
+            q.extend(kids.get(c, []))
+        return pid, desc
     return None, []
+
+
+def _pids_of_session(sess):
+    out = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    return _session_processes(out, sess)
 
 
 def _kill_session(sess):
@@ -430,14 +440,25 @@ def _kill_session(sess):
             except OSError:
                 pass
         time.sleep(0.8)
-        if _pids_of_session(sess)[0] is None:
+        # Re-read the exact session tree before escalating: a dead descendant's
+        # pid may already belong to an unrelated process on a busy machine.
+        master, desc = _pids_of_session(sess)
+        if master is None:
             return True
     for p in desc + [master]:
         try:
             os.kill(p, signal.SIGKILL)
         except OSError:
             pass
-    return True
+    time.sleep(0.1)
+    return _pids_of_session(sess)[0] is None
+
+
+def _kill_session_cli(args):
+    if len(args) != 2 or args[0] != "--kill-session" or not re.fullmatch(r"cove-[0-9]+", args[1]):
+        print("usage: cove_mcp.py --kill-session cove-<digits>", file=sys.stderr)
+        return 2
+    return 0 if _kill_session(args[1]) else 1
 
 
 # --- board geometry: where things are, and where there's room --------------------
@@ -1113,4 +1134,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        raise SystemExit(_kill_session_cli(sys.argv[1:]))
     main()

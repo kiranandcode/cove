@@ -17,6 +17,7 @@
 #     no termling focused, V/R/O/A/T/N/F/D/E... draw boxes, arrows, text, sticky
 #     notes, frames and todo lists. Drop a termling in a frame/box to zone it
 #   - Cmd/Ctrl+N spawns another terminal
+#   - Cmd+D permanently deletes the focused local terminal
 #   - Cmd+' steps through the notifications (Enter focuses, any other key goes back)
 extends Node2D
 
@@ -148,6 +149,8 @@ var _pan_once := -1          # term id to pan the camera to once (input required
 var _names := {}             # term_id -> custom name (persists across re-spawn)
 var _saved := {}             # layout restored from the previous run's state.json
 var _sessions := {}          # term_id -> abduco session name (once learned from ls)
+var _deleting_sessions := {} # term_id -> {session, until}: pending permanent deletion
+const DELETE_PENDING_MS := 10000
 var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
 var _name_by_session := {}   # session -> custom name, ditto
 var _pos_restored := {}      # term_id -> true once its position has been restored
@@ -640,9 +643,20 @@ func _is_page_file(id: int) -> bool:
 
 
 func _remove_group(id: int) -> void:
+	var sess := str(_sessions.get(id, ""))
 	if _groups.has(id):
 		_groups[id].queue_free()
 		_groups.erase(id)
+	_sessions.erase(id)   # a reused kitty id must not inherit a dead session
+	var deleting = _deleting_sessions.get(id, null)
+	if deleting is Dictionary and str(deleting.get("session", "")) == sess:
+		_name_by_session.erase(sess)
+		_pos_by_session.erase(sess)
+		_zone_by_session.erase(sess)
+		_names.erase(id)
+		_pos_restored.erase(id)
+		_zone_saved.erase(id)
+	_deleting_sessions.erase(id)
 	_page_meta.erase(id)
 	_zone_of.erase(id)
 	_quick_ask.erase(id)
@@ -916,9 +930,74 @@ func _close_origin(id: int) -> void:
 			_create_process(kitten_exe, ["@", "--to", kitty_socket, "close-window",
 				"--match", "id:%d" % pane], false)
 	var sess := str(_sessions.get(id, ""))
-	if sess != "":
-		_create_process("/usr/bin/pkill", ["-f", "abduco -A %s " % sess], false)
+	_terminate_session(sess)
 	_remove_group(id)
+
+
+# A closed kitty window only detaches from abduco, so a durable deletion must
+# terminate the exact session too. The helper uses the same process-tree cleanup
+# as the Cove MCP kill tool.
+func _terminate_session(sess: String) -> int:
+	if sess == "" or _session_token(sess) != sess:
+		return -1
+	var helper := ProjectSettings.globalize_path("res://mcp/cove_mcp.py")
+	return _create_process("/usr/bin/python3", [helper, "--kill-session", sess], false)
+
+
+func _local_terminal_count() -> int:
+	_expire_failed_deletions()
+	var count := 0
+	for id in _groups:
+		if _delete_pending(id):
+			continue
+		var t = _groups[id].terminal
+		if not t.page and not t.remote:
+			count += 1
+	return count
+
+
+func _delete_pending(id: int) -> bool:
+	var deleting = _deleting_sessions.get(id, null)
+	return deleting is Dictionary and bool(deleting.get("pending", false))
+
+
+func _expire_failed_deletions() -> void:
+	var now := Time.get_ticks_msec()
+	for id in _deleting_sessions.keys():
+		var deleting = _deleting_sessions[id]
+		var helper_pid := int(deleting.get("pid", -1))
+		if bool(deleting.get("pending", false)) and now >= int(deleting.get("until", 0)) \
+				and not _child_process_running(helper_pid):
+			deleting["pending"] = false
+
+
+func _delete_focused_term() -> void:
+	_expire_failed_deletions()
+	var id := _focused_id
+	if id == -1 or not _groups.has(id):
+		return
+	var g = _groups[id]
+	if g.terminal.page or g.terminal.remote:
+		return
+	if _delete_pending(id):
+		return
+	var sess := str(_sessions.get(id, ""))
+	if sess == "" or _session_token(sess) != sess:
+		push_warning("cove: cannot delete termling %d until its session is known" % id)
+		return
+	# run.sh lets kitty quit when its final window closes. Keep one local terminal
+	# so Cmd+N and the rest of the Cove remain usable.
+	if _local_terminal_count() <= 1:
+		push_warning("cove: cannot delete the last local termling; create another first")
+		return
+	var helper_pid := _terminate_session(sess)
+	if helper_pid <= 0:
+		push_warning("cove: could not start session cleanup for termling %d" % id)
+		return
+	_deleting_sessions[id] = {
+		"session": sess, "pid": helper_pid,
+		"until": Time.get_ticks_msec() + DELETE_PENDING_MS, "pending": true,
+	}
 
 
 # dismiss: this is you attending to it, so its notification goes. Focus that
@@ -1086,6 +1165,16 @@ func _input(event: InputEvent) -> void:
 	if _emacs_focused() and not (event.ctrl_pressed and not event.meta_pressed
 			and (event.keycode in [KEY_QUOTELEFT, KEY_TAB] or event.physical_keycode == KEY_QUOTELEFT)):
 		_on_key(event)
+		get_viewport().set_input_as_handled()
+		return
+	# Cmd+D permanently deletes the focused local terminal. Closing only kitty's
+	# window would leave its abduco session detached and crash recovery would
+	# bring it back on the next launch.
+	if event.keycode == KEY_D and event.meta_pressed and not event.ctrl_pressed \
+			and not event.alt_pressed and not event.shift_pressed \
+			and _focused_id != -1 and _groups.has(_focused_id) \
+			and not _groups[_focused_id].terminal.page and not _groups[_focused_id].terminal.remote:
+		_delete_focused_term()
 		get_viewport().set_input_as_handled()
 		return
 	# Cmd+C / Cmd+V: clipboard in and out of the focused termling. Copy grabs
@@ -2089,6 +2178,20 @@ func _reap_children() -> void:
 		if not OS.is_process_running(_child_pids[i]):
 			_child_pids.remove_at(i)
 	_child_mutex.unlock()
+
+
+# Check only children we still own. Calling is_process_running after another
+# poll reaped the pid reports ECHILD, and a reused pid must not hold a delete.
+func _child_process_running(pid: int) -> bool:
+	_child_mutex.lock()
+	var idx := _child_pids.find(pid)
+	var running := false
+	if idx != -1:
+		running = OS.is_process_running(pid)
+		if not running:
+			_child_pids.remove_at(idx)
+	_child_mutex.unlock()
+	return running
 
 
 # --- kitty ls polling (background thread) -----------------------------------
