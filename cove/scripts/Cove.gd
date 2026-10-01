@@ -2120,11 +2120,7 @@ func _ls_loop() -> void:
 		OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
 		var ptxt: String = pout[0] if pout.size() > 0 else ""
 		var sess_info := _scan_sessions(ptxt)
-		var data := _parse_ls(txt, sess_info)
-		_ls_mutex.lock()
-		_ls_data = data
-		_ls_gen += 1
-		_ls_mutex.unlock()
+		_update_ls_data(txt, sess_info)
 		OS.delay_msec(1000)
 
 
@@ -2312,11 +2308,29 @@ func _session_from_procs(procs) -> String:
 	return ""
 
 
-func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
-	var arr = JSON.parse_string(txt)
+func _update_ls_data(txt: String, sess_info: Dictionary) -> bool:
+	var data = _parse_ls(txt, sess_info)
+	# Kitty can briefly return no listing while it restarts. Keep the last
+	# good snapshot until remote control produces a complete JSON array.
+	if data == null:
+		return false
+	_ls_mutex.lock()
+	_ls_data = data
+	_ls_gen += 1
+	_ls_mutex.unlock()
+	return true
+
+
+func _parse_ls(txt: String, sess_info: Dictionary) -> Variant:
+	if txt.strip_edges().is_empty():
+		return null
+	var json := JSON.new()
+	if json.parse(txt) != OK:
+		return null
+	var arr = json.data
 	var res := {}
 	if typeof(arr) != TYPE_ARRAY:
-		return res
+		return null
 	for osw in arr:
 		for tab in osw.get("tabs", []):
 			for w in tab.get("windows", []):
