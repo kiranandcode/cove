@@ -48,6 +48,7 @@ var _agent := "shell"
 var _busy := false
 var _attention := false
 var _goal = null          # Vector2 commanded target, or null = wander
+var _goal_pinned := false # a user drop: collision response moves its resting point too
 var _dragging := false    # the user is sliding this termling around by the mouse
 var _home := Vector2.ZERO  # centre of the idle-wander neighbourhood
 var _home_set := false     # anchored once position is final (first _process tick)
@@ -60,6 +61,8 @@ var _crew_awake := true    # carriers animating (paused while the whole group is
 static var _sep_frame := -1
 static var _sep_pos := PackedVector2Array()
 static var _sep_ok := PackedByteArray()   # 1 where the child at that index is a group
+static var _sep_radius := PackedFloat32Array()
+static var _sep_pinned := PackedByteArray()
 
 
 func setup(id: int, path: String, world_bounds: Rect2) -> void:
@@ -117,11 +120,13 @@ func get_ground_pos() -> Vector2:
 
 func command_move(world_pos: Vector2) -> void:
 	_goal = world_pos
+	_goal_pinned = false
 
 
 func command_stop() -> void:
 	# Wander around wherever it is now, not back across the whole map.
 	_goal = null
+	_goal_pinned = false
 	_home = position
 	_home_set = true
 	_pick_target()
@@ -132,6 +137,7 @@ func command_stop() -> void:
 func begin_drag_move() -> void:
 	_dragging = true
 	_goal = null
+	_goal_pinned = false
 
 
 # Press-and-hold picked us up: a little hop so the lift is visible before the
@@ -154,6 +160,7 @@ func end_drag_move() -> void:
 	_home = position
 	_home_set = true
 	_goal = position   # hold where it was dropped rather than wandering straight off
+	_goal_pinned = true
 
 
 func _pick_target() -> void:
@@ -257,17 +264,40 @@ func _process(delta: float) -> void:
 				_home = position
 				_home_set = true
 				_pick_target()
-			_rig.position.y = lerp(_rig.position.y, 0.0, 12.0 * delta)
+			_rig.position.y = lerp(_rig.position.y, 0.0, clampf(12.0 * delta, 0.0, 1.0))
 			if _dragging:
 				# The mouse owns the position; carriers just hustle to keep up.
 				_left.set_state("walk"); _right.set_state("walk")
 			else:
+				var before := position
+				var navigating := _recover <= 0.0
 				if _recover > 0.0:
 					_recover -= delta
 					_left.set_state("surprised"); _right.set_state("surprised")
 				else:
 					_navigate(delta)
-				position += _separation() * delta
+				var avoid_step := _separation() * minf(delta, 1.0 / 30.0)
+				if _zone != null and (_goal == null or _goal_pinned):
+					# Idle members stay inside their zone even when a cramped frame
+					# cannot provide enough room to resolve every overlap.
+					var z: Rect2 = _zone
+					var candidate := position + avoid_step
+					candidate.x = clampf(candidate.x, z.position.x, z.end.x)
+					candidate.y = clampf(candidate.y, z.position.y, z.end.y)
+					avoid_step = candidate - position
+				if _goal_pinned and _goal != null and not avoid_step.is_zero_approx():
+					# A dropped termling's goal is its resting point. Let avoidance move
+					# that anchor too, otherwise navigation pulls it straight back into
+					# its neighbour every frame.
+					_goal += avoid_step
+				position += avoid_step
+				if navigating:
+					var moved := position - before
+					if moved.length_squared() > 0.0001:
+						_left.set_state("walk"); _right.set_state("walk")
+						_left.set_facing(moved.x); _right.set_facing(moved.x)
+					else:
+						_left.set_state("idle"); _right.set_state("idle")
 			_restore_shadow(delta)
 
 
@@ -280,7 +310,7 @@ func _navigate(delta: float) -> void:
 		var dir := to / dist
 		# agents that are busy scurry a little faster
 		var spd := SPEED * (1.25 if _busy else 1.0)
-		position += dir * spd * delta
+		position = position.move_toward(tgt, spd * delta)
 		_left.set_state("walk"); _right.set_state("walk")
 		_left.set_facing(dir.x); _right.set_facing(dir.x)
 	else:
@@ -300,27 +330,45 @@ func _separation() -> Vector2:
 	var parent := get_parent()
 	if parent == null:
 		return push
-	var min_d: float = terminal.onscreen_size().x * 0.55 + 180.0
 	var frame := Engine.get_process_frames()
 	if _sep_frame != frame or _sep_pos.size() != parent.get_child_count():
 		_sep_frame = frame
 		var kids := parent.get_children()
 		_sep_pos.resize(kids.size())
 		_sep_ok.resize(kids.size())
+		_sep_radius.resize(kids.size())
+		_sep_pinned.resize(kids.size())
 		for i in kids.size():
 			var ok: bool = kids[i].has_method("get_ground_pos")
 			_sep_ok[i] = 1 if ok else 0
 			_sep_pos[i] = kids[i].get_ground_pos() if ok else Vector2.ZERO
+			_sep_radius[i] = kids[i].terminal.onscreen_size().x * 0.275 + 90.0 if ok else 0.0
+			_sep_pinned[i] = 1 if ok and kids[i]._goal_pinned else 0
 	var me := get_index()
-	var min_d2 := min_d * min_d
+	var my_radius: float = _sep_radius[me]
+	var my_pinned := _sep_pinned[me] != 0
 	for i in _sep_pos.size():
 		if i == me or _sep_ok[i] == 0:
 			continue
-		var d: Vector2 = position - _sep_pos[i]
+		var other_pinned := _sep_pinned[i] != 0
+		if my_pinned and not other_pinned:
+			continue   # ordinary traffic yields to a user's pinned resting point
+		var min_d: float = my_radius + _sep_radius[i]
+		var min_d2 := min_d * min_d
+		var d: Vector2 = _sep_pos[me] - _sep_pos[i]
 		var d2 := d.length_squared()
-		if d2 > 0.25 and d2 < min_d2:
+		if d2 < min_d2:
 			var dist := sqrt(d2)
-			push += (d / dist) * (min_d - dist) * 2.8
+			# Coincident positions have no geometric direction. Split the pair in
+			# stable, opposite directions based on sibling order instead of leaving
+			# both at zero forever (or choosing fresh random jitter every frame).
+			var away: Vector2
+			if d2 <= 0.0001:
+				away = Vector2.LEFT if me < i else Vector2.RIGHT
+			else:
+				away = d / dist
+			var strength := 5.6 if other_pinned and not my_pinned else 2.8
+			push += away * (min_d - dist) * strength
 	return push.limit_length(SPEED * 2.5)
 
 
@@ -374,7 +422,7 @@ func _update_indicators(delta: float) -> void:
 	# (otherwise it reads as a permanent grey shadow behind every terminal).
 	var pulse := 0.5 + 0.35 * sin(_t * 4.0)
 	var target_a := (pulse if _busy else 0.0)
-	var a: float = lerp(_aura.modulate.a, target_a * 0.5, 6.0 * delta)
+	var a: float = lerp(_aura.modulate.a, target_a * 0.5, clampf(6.0 * delta, 0.0, 1.0))
 	if target_a == 0.0 and a < 0.002:
 		a = 0.0   # settle, instead of creeping toward 0 (and redrawing) forever
 	var m := Color(col.r, col.g, col.b, a)
@@ -394,8 +442,9 @@ func _restore_shadow(delta: float) -> void:
 		return
 	var ts: Vector2 = terminal.onscreen_size()
 	var base := maxf(ts.x, 40.0) * 0.95 / 128.0
-	_term_shadow.scale = _term_shadow.scale.lerp(Vector2(base, base * 0.4), 8.0 * delta)
-	_term_shadow.modulate.a = lerp(_term_shadow.modulate.a, 0.34, 8.0 * delta)
+	var weight := clampf(8.0 * delta, 0.0, 1.0)
+	_term_shadow.scale = _term_shadow.scale.lerp(Vector2(base, base * 0.4), weight)
+	_term_shadow.modulate.a = lerp(_term_shadow.modulate.a, 0.34, weight)
 
 
 # --- lift / drop ------------------------------------------------------------
