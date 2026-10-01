@@ -378,12 +378,20 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 '    if [ "$2" = "$OLD_KITTY_PID" ]; then echo "/fake/launcher/kitty --title cove"; else echo "/bin/sleep 30"; fi\n'
                 'else\n'
                 '    printf "%s %s\\n" "$OLD_KITTY_PID" "/fake/launcher/kitty --title cove"\n'
+                '    printf "%s %s\\n" "$OLD_GODOT_PID" "$GODOT --max-fps 30 --path $APP"\n'
+                '    printf "%s %s\\n" "$OTHER_GODOT_PID" "$GODOT --path $APP-copy"\n'
                 'fi\n',
             )
 
             old_kitty = subprocess.Popen(['/bin/sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             reaper = threading.Thread(target=old_kitty.wait, daemon=True)
             reaper.start()
+            old_godot = subprocess.Popen(['/bin/sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            godot_reaper = threading.Thread(target=old_godot.wait, daemon=True)
+            godot_reaper.start()
+            other_godot = subprocess.Popen(['/bin/sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            other_godot_reaper = threading.Thread(target=other_godot.wait, daemon=True)
+            other_godot_reaper.start()
             runtime.mkdir(parents=True)
             state = runtime / 'state.json'
             stale_frame = runtime / 'term-7.rgba'
@@ -430,6 +438,7 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'FIRST_SESSION_DEAD': '1' if first_session_dead else '0',
                 'GODOT_ARGS': str(root / 'godot-args'),
                 'GODOT_STARTED': str(godot_started),
+                'GODOT': str(godot),
                 'HOME': str(root / 'home'),
                 'KITTY_ARGS': str(kitty_args),
                 'KITTY_EXITED': str(kitty_exited),
@@ -439,6 +448,9 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'LS_BLINKS': '1' if ls_blinks else '0',
                 'LS_COUNT': str(ls_count),
                 'OLD_KITTY_PID': str(old_kitty.pid),
+                'OLD_GODOT_PID': str(old_godot.pid),
+                'OTHER_GODOT_PID': str(other_godot.pid),
+                'APP': str(repo / 'cove'),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
                 'LAUNCH_LANDS_LATE': '1' if launch_lands_late else '0',
@@ -453,6 +465,9 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                     ['/bin/bash', str(launcher)], cwd=repo, env=env,
                     text=True, capture_output=True, timeout=60, check=False,
                 )
+                godot_reaper.join(timeout=1)
+                old_godot_stopped = not godot_reaper.is_alive()
+                other_godot_survived = other_godot.poll() is None
             finally:
                 if reaper.is_alive():
                     old_kitty.terminate()
@@ -460,6 +475,18 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 if reaper.is_alive():
                     old_kitty.kill()
                     reaper.join(timeout=2)
+                if godot_reaper.is_alive():
+                    old_godot.terminate()
+                godot_reaper.join(timeout=2)
+                if godot_reaper.is_alive():
+                    old_godot.kill()
+                    godot_reaper.join(timeout=2)
+                if other_godot_reaper.is_alive():
+                    other_godot.terminate()
+                other_godot_reaper.join(timeout=2)
+                if other_godot_reaper.is_alive():
+                    other_godot.kill()
+                    other_godot_reaper.join(timeout=2)
 
             # Generous: the fake kitty is a python process, slow to notice
             # Godot under heavy load.
@@ -471,6 +498,8 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             self.assertEqual(sorted(f.name for f in scroll.iterdir()), ['cove-111.ansi', 'cove-222.ansi'])
             self.assertEqual((scroll / 'cove-111.ansi').read_text(), 'screen of id:1\n')
             self.assertEqual((scroll / 'cove-222.ansi').read_text(), 'screen of id:2\n')
+            self.assertTrue(old_godot_stopped, 'left an existing Godot running')
+            self.assertTrue(other_godot_survived, 'stopped a different Godot project')
             if bystander is not None:
                 self.assertIsNone(bystander.poll(), 'killed the process a stale kitty.pid named')
             if kitty_broken or listing_fails_after_stop:
