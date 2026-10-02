@@ -35,8 +35,9 @@ error if you aren't in one.
 - **`status(state, summary?)`**: `needs_you`, `blocked` or `done` puts a "!"
   badge on your termling and queues you for the user's attention. If the user
   isn't focused on anything, focus jumps to you; otherwise you wait in a queue,
-  and focus comes to you when they leave their current termling. Call it once;
-  don't repeat it. `working` clears it.
+  and focus comes to you when they leave their current termling. Do not repeat
+  the same state and summary; later state transitions are allowed. `working`
+  clears it.
 - The Stop/Notification hooks already ping when you finish or wait for input.
   Use `status` for something more specific ("blocked: need the API key").
 
@@ -78,6 +79,41 @@ watch every one on the board and step in. You own what you spawn (and what they
 spawn); only those can you drive. `cove-team` is the general workflow (tasks →
 frames → termlings → steer); `iterate-pr` is the PR version.
 
+### Own the child lifecycle
+
+Visible children are ongoing workstreams, not disposable command runners. The
+lead that spawns them owns their inventory and cleanup.
+
+- Use your own terminal for ordinary commands. Spawn a shell only when a
+  separate cwd, permission boundary, or genuinely long-running observable job
+  requires one. Batch related one-shot commands into one helper, then close it.
+- Before spawning, name the work item and its terminal condition. Use one live
+  child per workstream and send it follow-ups. A specialized workflow may rotate
+  fresh-context reviewers, but close one before starting its replacement unless
+  parallel review is intentional.
+- Spawn only as much work as you can actively supervise; queue the remainder.
+  A user authorizing a swarm does not require filling every available slot.
+- Reconcile `children` after each state-changing `wait`, completion,
+  interruption or change of direction, and before you finish or hand off.
+  `alive: true` means a termling is still open; `alive: false` is an exited
+  lineage record. Finalize an exited child with `kill(session)` so its owned
+  board artifacts and lineage are cleaned up.
+- Before `kill`, capture the result, preserve unique work, and inspect the whole
+  descendant subtree. `kill` is recursive: never kill an ancestor of active or
+  retained work. A blocked child may remain for user action or inspection; name
+  it, the reason, and the next action in your handoff.
+- Inspect every `kill` result. Only sessions listed in `killed` are confirmed
+  closed. If `ok: false`, reconcile `failed` and `retained` against `children`
+  and handle any `cleanup_error`; that field means board artifacts for sessions
+  listed in `killed` still need cleanup, not that `failed` or `retained` closed.
+  Do not claim completion while either remains.
+- If you have a parent, make a final `report(state="done"|"failed", ...)` your
+  last state-changing action; the parent may kill your whole subtree as soon as
+  it arrives. A child uses `status` only when it needs user attention. A
+  top-level lead instead finishes with `status(done, ...)`.
+- Never leave an idle prompt-only shell, duplicate live helper, or abandoned
+  task. Never close a non-owned termling; report it to its parent or the user.
+
 - **`spawn(name, frame?, cwd?, command?, prompt?, link?, link_text?)`**:
   a new termling in `frame` (with no frame, it gets a small frame of its own in
   free space beside you), with a dashed grey arrow from your termling to it. `command` runs in
@@ -92,12 +128,15 @@ frames → termlings → steer); `iterate-pr` is the PR version.
 - **`wait(ids?, mode?, timeout?)`**: block until a child ends a turn (its Stop
   hook), needs input (Notification), `report`s, or exits, counting only what
   happened since your last `send`. Returns the event, reports and screen tail.
-  `timed_out` means call it again.
+  Events and reports returned in `finished` are consumed even when
+  `timed_out: true`; process them before waiting again on `still_running`.
 - **`report(text, state?)`**: a child tells its parent how it went. Lead with
-  the verdict (`APPROVED: …`).
+  the verdict (`APPROVED: …`). A final done/failed report is your last
+  state-changing action; use `progress` for non-final updates.
 - **`children`**: your descendants (alive, frame, last event) and reports.
+  Finalize an exited `alive: false` record with `kill(session)`.
 - **`place(id, frame? | pos?, teleport?)`** / **`kill(id)`**: move a child into
-  a frame; close it (and its descendants and your arrow to it).
+  a frame; recursively close it and its descendants after a subtree audit.
 
 Laying out: **`add_frame(title, w, h, x?, y?, near?, inside?)`** draws a titled
 frame you own, in free space when you omit x/y (`inside` nests it in another
@@ -108,7 +147,9 @@ camera. Look after you lay things out, and fix overlaps with
 `update_note(id, x, y, w, h)`. A termling's screen is about 330×185 world units,
 and its crew stand below it, so a frame for three side by side is about 1300×480.
 
-No strays: every child goes in a frame, and you kill children whose job is done.
+No strays: every child goes in a frame. A final `children` audit closes every
+completed live child and finalizes every exited child you own unless the user
+explicitly asked to retain it.
 
 ## Notes
 
