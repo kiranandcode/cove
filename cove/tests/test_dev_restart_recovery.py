@@ -31,6 +31,11 @@ class DevRestartRecoveryTest(unittest.TestCase):
         self.assertNotIn('/tmp/cove', source)
         target = repo / 'cove' / name
         self.write_executable(target, source)
+        helper = repo / 'cove' / 'cove-iosurface.sh'
+        self.write_executable(helper, (REPO_ROOT / 'cove' / 'cove-iosurface.sh').read_text())
+        probe = repo / 'cove' / 'scripts' / 'IOSurfaceProbe.gd'
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text((REPO_ROOT / 'cove' / 'scripts' / 'IOSurfaceProbe.gd').read_text())
         return target
 
     def test_dev_delegates_existing_sessions_to_warm_restart(self) -> None:
@@ -45,8 +50,13 @@ class DevRestartRecoveryTest(unittest.TestCase):
             kitten = repo / 'kitty' / 'launcher' / 'kitty.app' / 'Contents' / 'MacOS' / 'kitten'
             godot = fake_bin / 'godot'
             unexpected = root / 'unexpected-start'
-            for executable in (kitty, kitten, godot):
+            for executable in (kitty, kitten):
                 self.write_executable(executable, f'#!/bin/sh\n: > "{unexpected}"\n')
+            self.write_executable(
+                godot,
+                f'#!/bin/sh\ncase " $* " in *" --script "*) echo COVE_IOSURFACE_PROBE=1; exit 0 ;; esac\n'
+                f': > "{unexpected}"\n',
+            )
             self.write_executable(
                 repo / 'cove' / 'bin' / 'abduco',
                 '#!/bin/sh\nprintf \'%s\\n\' \'Active sessions (on host test)\' \'* Thu 2026-09-24 00:00:00 cove-111\'\n',
@@ -55,7 +65,9 @@ class DevRestartRecoveryTest(unittest.TestCase):
             remote_called = root / 'remote-called'
             self.write_executable(
                 repo / 'cove' / 'reload-kitty.sh',
-                f'#!/bin/sh\nprintf "%s\\n" "$COVE_LAUNCH_LOCK_HELD" > "{reload_called}"\n',
+                f'#!/bin/sh\n. "{runtime / "dev-env"}"\nprintf "%s\\n" "$COVE_LAUNCH_LOCK_HELD" '
+                f'"$COVE_IOSURFACE" "$COVE_IOSURFACE_RESOLVED" '
+                f'"${{KITTY_COVE_IOSURFACE-<unset>}}" > "{reload_called}"\n',
             )
             self.write_executable(repo / 'cove' / 'cove-remote-start.sh', f'#!/bin/sh\n: > "{remote_called}"\n')
             # If the handoff ever regresses, dev.sh falls through to stopping
@@ -64,11 +76,12 @@ class DevRestartRecoveryTest(unittest.TestCase):
             for tool in ('pkill', 'ps'):
                 self.write_executable(fake_bin / tool, f'#!/bin/sh\n: > "{stopped}"\nexit 1\n')
             (repo / 'cove' / '.godot').mkdir(parents=True)
-            (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
+            (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('res://cove.gdextension\n')
 
             runtime.mkdir(parents=True)
             state = runtime / 'state.json'
             state.write_text('saved-layout\n')
+            (runtime / 'dev-env').write_text('COVE_IOSURFACE=1\nCOVE_IOSURFACE_RESOLVED=1\n')
             result = subprocess.run(
                 ['/bin/bash', str(launcher)],
                 cwd=repo,
@@ -85,7 +98,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(reload_called.read_text(), '1\n')
+            self.assertEqual(reload_called.read_text(), '1\n1\n1\n1\n')
             self.assertTrue(remote_called.exists())
             self.assertFalse(unexpected.exists())
             self.assertFalse(stopped.exists())
@@ -97,10 +110,15 @@ class DevRestartRecoveryTest(unittest.TestCase):
                     f'COVE_KITTY_SOCKET=unix:{runtime}-kitty',
                     f'APP={repo / "cove"}',
                     f'GODOT={godot}',
+                    'COVE_IOSURFACE=1',
+                    'COVE_IOSURFACE_RESOLVED=1',
                 ],
             )
 
-    def run_cold_start(self, *, kitty_answers: bool, ready_polls: int | None = None) -> dict:
+    def run_cold_start(
+        self, *, kitty_answers: bool, ready_polls: int | None = None,
+        iosurface: str | None = None,
+    ) -> dict:
         """Run dev.sh with no sessions, so it cold-starts a fake kitty.
 
         pkill and ps are fakes, so nothing touches the live Cove. Returns the
@@ -132,6 +150,8 @@ from pathlib import Path
 
 runtime = Path(os.environ['RUNTIME'])
 runtime.mkdir(parents=True, exist_ok=True)
+(Path(os.environ['KITTY_IOSURFACE'])
+    .write_text(os.environ.get('KITTY_COVE_IOSURFACE', '<unset>')))
 (runtime / 'kitty.pid').write_text('stale\\n')
 (runtime / 'dev-env').write_text('stale\\n')
 Path(os.environ['SOCKET']).write_text('stale\\n')
@@ -155,24 +175,37 @@ while True:
         godot_started = root / 'godot-started'
         remote_started = root / 'remote-started'
         godot = fake_bin / 'godot'
-        self.write_executable(godot, f'#!/bin/sh\n: > "{godot_started}"\n')
+        probe_called = root / 'probe-called'
+        self.write_executable(
+            godot,
+            '#!/bin/sh\n'
+            'case " $* " in\n'
+            '  *" --script "*) : > "$PROBE_CALLED"; echo COVE_IOSURFACE_PROBE=1; exit 0 ;;\n'
+            'esac\n'
+            ': > "$GODOT_STARTED"\n',
+        )
         self.write_executable(repo / 'cove' / 'cove-remote-start.sh', f'#!/bin/sh\n: > "{remote_started}"\n')
         self.write_executable(fake_bin / 'pkill', '#!/bin/sh\nexit 1\n')
         self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
         self.write_executable(fake_bin / 'sleep', '#!/bin/sh\nexec /bin/sleep 0.01\n')
         (repo / 'cove' / '.godot').mkdir(parents=True)
-        (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
+        (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('res://cove.gdextension\n')
         runtime.parent.mkdir(parents=True)
 
         env = {
             'GODOT': str(godot),
+            'GODOT_STARTED': str(godot_started),
             'HOME': str(root / 'home'),
             'KITTY_PID': str(kitty_pid),
+            'KITTY_IOSURFACE': str(root / 'kitty-iosurface'),
             'PATH': f'{fake_bin}:/usr/bin:/bin',
+            'PROBE_CALLED': str(probe_called),
             'RUNTIME': str(runtime),
             'SHELL': '/bin/zsh',
             'SOCKET': str(socket),
         }
+        if iosurface is not None:
+            env['COVE_IOSURFACE'] = iosurface
         # The fake kitty outlives dev.sh on success, and would on a failed
         # cleanup: kill it whatever happens (before the rmtree above, as
         # cleanups run last-in first-out). A generous timeout: the machine
@@ -186,6 +219,7 @@ while True:
             'result': result, 'repo': repo, 'runtime': runtime, 'socket': socket,
             'kitty_pid': kitty_pid, 'godot': godot, 'kitten': kitten,
             'godot_started': godot_started, 'remote_started': remote_started,
+            'kitty_iosurface': root / 'kitty-iosurface', 'probe_called': probe_called,
         }
 
     def kill_fake_kitty(self, kitty_pid: Path) -> None:
@@ -235,6 +269,8 @@ while True:
                 f'COVE_KITTY_SOCKET=unix:{runtime}-kitty',
                 f'APP={run["repo"] / "cove"}',
                 f'GODOT={run["godot"]}',
+                'COVE_IOSURFACE=0',
+                'COVE_IOSURFACE_RESOLVED=0',
                 f'COVE_KITTY_PID={pid}',
             ],
         )
@@ -246,11 +282,23 @@ while True:
             time.sleep(0.05)
         self.assertTrue(run['godot_started'].exists())
 
+    def test_dev_enables_iosurface_only_after_the_class_probe(self) -> None:
+        run = self.run_cold_start(kitty_answers=True, iosurface='1')
+
+        self.assertEqual(run['result'].returncode, 0, run['result'].stderr)
+        self.assertEqual(run['kitty_iosurface'].read_text(), '1')
+        self.assertTrue(run['probe_called'].exists())
+        env = (run['runtime'] / 'dev-env').read_text().splitlines()
+        self.assertIn('COVE_IOSURFACE=1', env)
+        self.assertIn('COVE_IOSURFACE_RESOLVED=1', env)
+
     def exercise_reload(
         self, *, launch_times_out: bool = False, stays_attached: bool = False,
         kitty_broken: bool = False, first_session_dead: bool = False,
         stale_pid_file: bool = False, listing_fails_after_stop: bool = False,
         ls_blinks: bool = False, launch_lands_late: bool = False,
+        persisted_iosurface: str = '0', iosurface_override: str | None = None,
+        inherited_kitty_iosurface: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory(prefix='cove-reload-test-') as tdir:
             root = Path(tdir)
@@ -259,6 +307,8 @@ while True:
             socket = Path(f'{runtime}-kitty')
             fake_bin = root / 'bin'
             launcher = self.copy_script('reload-kitty.sh', repo, runtime)
+            (repo / 'cove' / '.godot').mkdir(parents=True)
+            (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('res://cove.gdextension\n')
 
             kitty = repo / 'kitty' / 'launcher' / 'kitty'
             kitten = repo / 'kitty' / 'launcher' / 'kitty.app' / 'Contents' / 'MacOS' / 'kitten'
@@ -299,6 +349,7 @@ from pathlib import Path
 
 args = Path(os.environ['KITTY_ARGS'])
 args.write_text('\\n'.join(sys.argv[1:]) + '\\n')
+Path(os.environ['KITTY_IOSURFACE']).write_text(os.environ.get('KITTY_COVE_IOSURFACE', '<unset>'))
 if os.environ['NEW_KITTY_BROKEN'] != '1':
     Path(os.environ['KITTY_READY']).touch()
     # Its first window: the session's, unless that died (abduco -a fails).
@@ -368,7 +419,11 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             self.write_executable(wrapper, '#!/bin/sh\nexit 0\n')
             self.write_executable(
                 godot,
-                '#!/bin/sh\nprintf "%s\\n" "$*" > "$GODOT_ARGS"\n: > "$GODOT_STARTED"\n',
+                '#!/bin/sh\n'
+                'case " $* " in\n'
+                '  *" --script "*) : > "$PROBE_CALLED"; echo COVE_IOSURFACE_PROBE=1; exit 0 ;;\n'
+                'esac\n'
+                'printf "%s\\n" "$*" > "$GODOT_ARGS"\n: > "$GODOT_STARTED"\n',
             )
             self.write_executable(fake_bin / 'pkill', '#!/bin/sh\nexit 1\n')
             self.write_executable(
@@ -402,7 +457,10 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             (runtime / 'kitty.pid').write_text(f'{(bystander or old_kitty).pid}\n')
             (runtime / 'dev-env').write_text(
                 f'COVE_KITTEN={kitten}\nCOVE_KITTY_SOCKET=unix:{socket}\n'
-                f'APP={repo / "cove"}\nGODOT={godot}\nCOVE_KITTY_PID={old_kitty.pid}\n'
+                f'APP={repo / "cove"}\nGODOT={godot}\n'
+                f'COVE_IOSURFACE={persisted_iosurface}\n'
+                f'COVE_IOSURFACE_RESOLVED={persisted_iosurface}\n'
+                f'COVE_KITTY_PID={old_kitty.pid}\n'
             )
             # The old kitty's windows: a first-run session (-A), a reattached one
             # (-a), and a window with no session, whose screen isn't saved.
@@ -432,6 +490,7 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'GODOT_STARTED': str(godot_started),
                 'HOME': str(root / 'home'),
                 'KITTY_ARGS': str(kitty_args),
+                'KITTY_IOSURFACE': str(root / 'kitty-iosurface'),
                 'KITTY_EXITED': str(kitty_exited),
                 'KITTY_READY': str(kitty_ready),
                 'LANDED': str(landed),
@@ -440,6 +499,7 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'LS_COUNT': str(ls_count),
                 'OLD_KITTY_PID': str(old_kitty.pid),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'PROBE_CALLED': str(root / 'probe-called'),
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
                 'LAUNCH_LANDS_LATE': '1' if launch_lands_late else '0',
                 'LATE': str(root / 'late-launch'),
@@ -448,6 +508,10 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'REATTACH': str(reattach),
                 'SHELL': '/bin/zsh',
             }
+            if iosurface_override is not None:
+                env['COVE_IOSURFACE'] = iosurface_override
+            if inherited_kitty_iosurface:
+                env['KITTY_COVE_IOSURFACE'] = '1'
             try:
                 result = subprocess.run(
                     ['/bin/bash', str(launcher)], cwd=repo, env=env,
@@ -473,6 +537,8 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             self.assertEqual((scroll / 'cove-222.ansi').read_text(), 'screen of id:2\n')
             if bystander is not None:
                 self.assertIsNone(bystander.poll(), 'killed the process a stale kitty.pid named')
+            requested = iosurface_override if iosurface_override is not None else persisted_iosurface
+            resolved = '1' if requested == '1' else '0'
             if kitty_broken or listing_fails_after_stop:
                 # A failed reload keeps dev-env (reload.sh needs it) minus the
                 # dead kitty's pid, and doesn't start Godot.
@@ -483,7 +549,8 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 self.assertEqual(
                     (runtime / 'dev-env').read_text().splitlines(),
                     [f'COVE_KITTEN={kitten}', f'COVE_KITTY_SOCKET=unix:{socket}',
-                     f'APP={repo / "cove"}', f'GODOT={godot}'],
+                     f'APP={repo / "cove"}', f'GODOT={godot}',
+                     f'COVE_IOSURFACE={requested}', f'COVE_IOSURFACE_RESOLVED={resolved}'],
                 )
                 self.assertFalse((runtime / 'kitty.pid').exists())
                 self.assertFalse(godot_started.exists())
@@ -514,7 +581,14 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             self.assertIn(f'COVE_KITTY_SOCKET=unix:{socket}\n', (runtime / 'dev-env').read_text())
             self.assertIn(f'COVE_KITTY_PID={(runtime / "kitty.pid").read_text().strip()}\n',
                           (runtime / 'dev-env').read_text())
-            self.assertEqual((root / 'godot-args').read_text().strip(), f'--path {repo / "cove"}')
+            self.assertIn(f'COVE_IOSURFACE={requested}\n', (runtime / 'dev-env').read_text())
+            self.assertIn(f'COVE_IOSURFACE_RESOLVED={resolved}\n', (runtime / 'dev-env').read_text())
+            self.assertEqual(
+                (root / 'kitty-iosurface').read_text(),
+                '1' if resolved == '1' else '<unset>',
+            )
+            self.assertEqual((root / 'godot-args').read_text().strip(),
+                             f'--path {repo / "cove"} --max-fps 60')
             self.assertTrue(kitty_exited.exists())
 
     def test_reload_recovers_after_old_kitty_detaches(self) -> None:
@@ -546,7 +620,10 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             fake_bin = root / 'bin'
             launcher = self.copy_script('reload.sh', repo, runtime)
             called = root / 'reload-kitty-called'
-            self.write_executable(repo / 'cove' / 'reload-kitty.sh', f'#!/bin/sh\n: > "{called}"\n')
+            self.write_executable(
+                repo / 'cove' / 'reload-kitty.sh',
+                f'#!/bin/sh\n. "{runtime / "dev-env"}"\nprintf "%s" "$COVE_IOSURFACE" > "{called}"\n',
+            )
             self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
             godot = fake_bin / 'godot'
             self.write_executable(godot, f'#!/bin/sh\n: > "{root / "godot-started"}"\n')
@@ -554,6 +631,7 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
             (runtime / 'dev-env').write_text(
                 f'COVE_KITTEN=/nonexistent\nCOVE_KITTY_SOCKET=unix:{runtime}-kitty\n'
                 f'APP={repo / "cove"}\nGODOT={godot}\n'
+                'COVE_IOSURFACE=1\nCOVE_IOSURFACE_RESOLVED=1\n'
             )
             result = subprocess.run(
                 ['/bin/bash', str(launcher)], cwd=repo,
@@ -561,7 +639,41 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 text=True, capture_output=True, timeout=10, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(called.exists())
+            self.assertEqual(called.read_text(), '1')
+            self.assertFalse((root / 'godot-started').exists())
+
+    def test_reload_sh_passes_an_explicit_iosurface_override_to_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix='cove-reload-sh-test-') as tdir:
+            root = Path(tdir)
+            repo = root / 'repo'
+            runtime = root / 'runtime' / 'cove'
+            fake_bin = root / 'bin'
+            launcher = self.copy_script('reload.sh', repo, runtime)
+            called = root / 'reload-kitty-called'
+            self.write_executable(
+                repo / 'cove' / 'reload-kitty.sh',
+                f'#!/bin/sh\nprintf "%s" "$COVE_IOSURFACE" > "{called}"\n',
+            )
+            self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
+            godot = fake_bin / 'godot'
+            self.write_executable(godot, f'#!/bin/sh\n: > "{root / "godot-started"}"\n')
+            runtime.mkdir(parents=True)
+            (runtime / 'dev-env').write_text(
+                f'COVE_KITTEN=/nonexistent\nCOVE_KITTY_SOCKET=unix:{runtime}-kitty\n'
+                f'APP={repo / "cove"}\nGODOT={godot}\n'
+                'COVE_IOSURFACE=1\nCOVE_IOSURFACE_RESOLVED=1\n'
+            )
+            result = subprocess.run(
+                ['/bin/bash', str(launcher)], cwd=repo,
+                env={
+                    'COVE_IOSURFACE': '0',
+                    'HOME': str(root / 'home'),
+                    'PATH': f'{fake_bin}:/usr/bin:/bin',
+                },
+                text=True, capture_output=True, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(called.read_text(), '0')
             self.assertFalse((root / 'godot-started').exists())
 
     def test_reload_does_not_relaunch_a_window_that_landed(self) -> None:
@@ -569,6 +681,18 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
 
     def test_reload_waits_for_a_timed_out_launch_that_lands_late(self) -> None:
         self.exercise_reload(launch_lands_late=True)
+
+    def test_reload_preserves_enabled_iosurface_mode(self) -> None:
+        self.exercise_reload(persisted_iosurface='1')
+
+    def test_reload_explicit_zero_clears_an_inherited_kitty_flag(self) -> None:
+        self.exercise_reload(
+            persisted_iosurface='1', iosurface_override='0',
+            inherited_kitty_iosurface=True,
+        )
+
+    def test_failed_reload_keeps_enabled_iosurface_mode(self) -> None:
+        self.exercise_reload(persisted_iosurface='1', kitty_broken=True)
 
 
 class ReattachTest(unittest.TestCase):

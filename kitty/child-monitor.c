@@ -1112,7 +1112,12 @@ render(monotonic_t now, bool input_read) {
     EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
     static monotonic_t last_render_at = MONOTONIC_T_MIN;
     monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
-    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window && !cove_has_pending_control()) {
+    // Cove's hidden windows can receive continuous terminal output, but their
+    // Godot consumer cannot display frames faster than its own cap. Respect the
+    // repaint delay even when input arrived, while control messages still bypass
+    // it so resize, spawn and input routing stay responsive.
+    if ((!input_read || cove_enabled()) && time_since_last_render < OPT(repaint_delay)
+            && !global_state.thumbnail_callback.os_window && !cove_has_pending_control()) {
         set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
         return;
     }

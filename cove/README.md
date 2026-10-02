@@ -11,17 +11,17 @@ sprites, **Cmd/Ctrl+N** to spawn, **click to focus**, and full keyboard input
 
 ## How it works
 
-- `kitty/menagerie.c` (behind the `KITTY_MENAGERIE` env var): in this mode each
+- `kitty/cove.c` (behind the `KITTY_COVE` env var): in this mode each
   kitty OS window is created **hidden** and rendered into its `indirect_output`
   FBO (an app-owned texture, readable even while hidden). Each frame is copied
-  into a per-window memory-mapped file `/tmp/kitty-menagerie/term-<id>.rgba`
+  into a per-window memory-mapped file `/tmp/cove/term-<id>.rgba`
   (header carries width/height/seq and the pane id for input targeting). The
   file is removed when its terminal closes.
   - C touch points: the module itself, plus one `needs_layers` line + a publish
     call in `child-monitor.c`, a render-gate bypass + force-hidden in `glfw.c`,
-    and a cleanup call in `state.c`. All guarded by menagerie mode; normal kitty
+    and a cleanup call in `state.c`. All guarded by Cove mode; normal kitty
     is unaffected.
-- `godot/` (Godot 4.6): `scripts/Menagerie.gd` discovers terminals by scanning
+- `cove/` (Godot 4.6): `scripts/Cove.gd` discovers terminals by scanning
   that directory, shows each as a `TermCritter` (`scripts/TermCritter.gd`)
   sprite, and:
   - **drag** a terminal with the mouse, **click** to focus (focused is bright +
@@ -30,7 +30,7 @@ sprites, **Cmd/Ctrl+N** to spawn, **click to focus**, and full keyboard input
   - keyboard goes to the focused terminal via `kitten @ send-text` / `send-key
     --match id:<pane>`, with modifiers preserved (Ctrl+C etc. reach the shell).
 
-Zero-copy via IOSurface (replacing the CPU readback) is Phase 2. See DESIGN.md.
+Optional zero-copy via IOSurface replaces the CPU readback on macOS. See below.
 
 ## Building kitty
 
@@ -61,10 +61,10 @@ recompile. `./kitty/launcher/kitty --version` should print `kitty 0.48.x`.
 ## Running the demo
 
 ```sh
-godot/run.sh
+cove/run.sh
 ```
 
-That launches the hacked kitty in menagerie mode (hidden window, remote control
+That launches the hacked kitty in Cove mode (hidden window, remote control
 on), waits for the first terminal, then opens the Godot host. In the Godot
 window: type to drive the focused terminal, click a terminal to focus it, drag
 to move it, **Cmd/Ctrl+N** for a new terminal. Set `GODOT=/path/to/godot` if
@@ -74,28 +74,31 @@ godot isn't on your PATH.
 
 ```sh
 # Terminal 1: hacked kitty, headless (no window) + remote control
-KITTY_MENAGERIE=1 ./kitty/launcher/kitty \
-  --listen-on unix:/tmp/menagerie-kitty -o allow_remote_control=yes -o sync_to_monitor=no zsh
+KITTY_COVE=1 KITTY_COVE_DIR=/tmp/cove ./kitty/launcher/kitty \
+  --listen-on unix:/tmp/cove-kitty -o allow_remote_control=yes -o sync_to_monitor=no zsh
 
 # Terminal 2: spawn another terminal (what Cmd+N does), and type into one
 K=./kitty/launcher/kitty.app/Contents/MacOS/kitten
-$K @ --to unix:/tmp/menagerie-kitty launch --type=os-window zsh
-$K @ --to unix:/tmp/menagerie-kitty send-text $'echo hello from outside\n'
-ls /tmp/kitty-menagerie/   # one term-<id>.rgba per terminal
+$K @ --to unix:/tmp/cove-kitty launch --type=os-window zsh
+$K @ --to unix:/tmp/cove-kitty send-text $'echo hello from outside\n'
+ls /tmp/cove/   # one term-<id>.rgba per terminal
 
 # Terminal 3: the Godot host on its own (reads the frame files)
-godot --path godot
+godot --path cove
 ```
 
 ## Env vars
 
 | Var                     | Meaning                                             |
 |-------------------------|-----------------------------------------------------|
-| `KITTY_MENAGERIE`       | set (any value) to turn on headless menagerie mode  |
-| `KITTY_MENAGERIE_DIR`   | dir for per-terminal files (default `/tmp/kitty-menagerie`) |
-| `MENAGERIE_KITTEN`      | path to the `kitten` binary (Godot spawn + input)   |
-| `MENAGERIE_KITTY_SOCKET`| kitty remote-control socket, e.g. `unix:/tmp/menagerie-kitty` |
-| `MENAGERIE_SHOT`        | if set, Godot saves a screenshot there after ~120 frames and quits (headless verification) |
+| `KITTY_COVE`             | set (any value) to turn on headless Cove mode       |
+| `KITTY_COVE_DIR`         | dir for per-terminal files (default `/tmp/cove`)    |
+| `COVE_KITTEN`            | path to the `kitten` binary (Godot spawn + input)   |
+| `COVE_KITTY_SOCKET`      | kitty remote-control socket, e.g. `unix:/tmp/cove-kitty` |
+| `COVE_IOSURFACE`         | `1` requests zero-copy; `0` selects file transport |
+| `COVE_IOSURFACE_RESOLVED`| launch diagnostic: `1` only after the class probe succeeds |
+| `KITTY_COVE_IOSURFACE`   | internal presence-only flag derived by the launchers |
+| `COVE_SHOT`              | if set, Godot saves a screenshot there after ~320 frames and quits |
 
 ## The scene (2.5D)
 
@@ -115,17 +118,17 @@ still a `TermCritter` (readback or IOSurface), carried at a small `target_width`
 
 ## Hacking in the Godot editor
 
-Open `godot/project.godot` in Godot 4.6. `scenes/TermCritter.tscn` is one
+Open `cove/project.godot` in Godot 4.6. `scenes/TermCritter.tscn` is one
 terminal: a `Screen` sprite plus a `Border` and `Nameplate` you can restyle, and
 you can add your own child nodes (glow, particles, an `AnimationPlayer`) — they
 ride along with every terminal. `scenes/main.tscn` is the world. Press F5 to run;
-if kitty is already running in menagerie mode the terminals appear, otherwise the
+if kitty is already running in Cove mode the terminals appear, otherwise the
 scene is empty until you launch one.
 
-## Zero-copy IOSurface transport (optional, macOS)
+## Zero-copy IOSurface transport (experimental, opt-in, macOS)
 
-By default frames travel via a CPU readback into the per-terminal file. Set
-`KITTY_MENAGERIE_IOSURFACE=1` on the kitty side and each terminal is instead
+By default frames travel via a CPU readback into the per-terminal file. Launch
+with `COVE_IOSURFACE=1` and each terminal is instead
 blitted (GPU→GPU) into an `IOSurface`; its id is published in the file header and
 Godot imports it as a Metal `Texture2DRD` — no CPU copy. This needs the
 `gdext/` GDExtension built:
@@ -138,40 +141,48 @@ git clone --depth 1 --branch 4.5 --recurse-submodules \
 godot --headless --dump-gdextension-interface  # -> gdextension_interface.h
 godot --headless --dump-extension-api          # -> extension_api.json
 cp gdextension_interface.h /tmp/godot-cpp/gdextension/
-cd godot/gdext && scons target=template_debug arch=arm64 custom_api_file=/path/to/extension_api.json
+cd cove/gdext && scons target=template_debug custom_api_file=/path/to/extension_api.json
 ```
 
-That builds `godot/bin/libmenagerie.macos.template_debug.arm64.dylib`, wired up by
-`godot/menagerie.gdextension`. Godot registers a new `.gdextension` only during a
+That builds `cove/bin/libcove.macos.template_debug.universal.dylib`, wired up by
+`cove/cove.gdextension`. Godot registers a new `.gdextension` only during a
 project import, so run it once (or open the project in the editor):
 
 ```sh
-godot --path godot --editor --headless --quit   # registers the extension
+godot --path cove --editor --headless --quit   # registers the extension
 ```
 
 Then launch with the transport on:
 
 ```sh
-MENAGERIE_IOSURFACE=1 godot/run.sh   # run.sh does the import step for you
+COVE_IOSURFACE=1 cove/run.sh
 ```
 
-Without the extension, Godot silently falls back to the readback file, so the
-demo always runs.
+The transport is fixed when kitty starts. If `run.sh` finds an existing kitty it
+only relaunches Godot. Restart kitty to change the transport; in dev mode use
+`COVE_IOSURFACE=0|1 cove/reload-kitty.sh` so the termlings survive.
+
+The launcher probes for the `CoveIOSurface` class before setting kitty's
+presence-only `KITTY_COVE_IOSURFACE` flag. If the probe fails it prints a warning
+and falls back to the readback file. Dev-mode warm reloads retain both the
+request and its last resolved value in `/tmp/cove/dev-env`. The probe verifies
+that the class loads; it does not prove cross-process GPU synchronization, so the
+transport remains opt-in.
 
 ## Input transport
 
 Keyboard, mouse, and resize go over a **persistent unix socket**
-(`$KITTY_MENAGERIE_DIR/input.sock`, served by a listener thread in hacked kitty)
+(`$KITTY_COVE_DIR/input.sock`, served by a listener thread in hacked kitty)
 — no `kitten` process per event. Messages are `[kind][id]…`: kind 0 writes raw
 terminal bytes to a pane; kind 1 resizes an OS window (queued for the main
 thread, applied via `resize_os_window`). Keyboard/mouse are encoded to raw
-terminal bytes in Godot. Needs the `gdext/` extension (class `MenagerieInput`);
+terminal bytes in Godot. Needs the `gdext/` extension (class `CoveInput`);
 without it Godot falls back to `kitten @ send-text` / `resize-os-window`. Only
 spawning a terminal (`launch`) still uses kitty remote control.
 
 The IOSurface transport is **double-buffered**: kitty ping-pongs between two
-surfaces and publishes which one holds the latest complete frame, so Godot never
-samples a half-blitted frame.
+surfaces and publishes which one should hold the latest complete frame. There is
+not yet an explicit cross-process GPU fence.
 
 ## Remote termlings (multi-device)
 

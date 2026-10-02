@@ -69,9 +69,10 @@ var _last_read_ms := 0   # when the rgba path last read a frame (see UNFOCUSED_R
 var _last_head_ms := 0   # when poll() last read the header (see OFFSCREEN_HEAD_MS)
 const OFFSCREEN_HEAD_MS := 250
 # Suspension (kitty MSG_SUSPEND): a termling well off screen for SUSPEND_AFTER_MS
-# asks kitty to stop rendering it and free its spare frame buffer; it resumes the
-# moment it's within half a view of the screen, focused, or screenshotted, so a
-# fresh frame is there before it's visible. suspend_sink(on) sends the message.
+# asks kitty to stop rendering it and, with IOSurface, free its spare frame
+# buffer; it resumes the moment it's within half a view of the screen, focused,
+# or screenshotted, so a fresh frame is there before it's visible.
+# suspend_sink(on) sends the message and reports whether kitty received it.
 const SUSPEND_AFTER_MS := 10000
 var suspend_sink: Callable
 var _suspended := false
@@ -117,7 +118,7 @@ func poll() -> void:
 	# every OFFSCREEN_HEAD_MS: each read is two seeks and a read syscall, ~70
 	# termlings x 60 fps, and nothing it carries is visible out there. Near or on
 	# screen (and when focused) it's still read every frame.
-	if iosurface_id != 0 and not page and suspend_sink.is_valid():
+	if not page and suspend_sink.is_valid():
 		_update_suspend()
 	if _last_seq != -1 and not force_read and not _focused:   # (IOSurface termlings never set _tex)
 		var now_ms := Time.get_ticks_msec()
@@ -222,21 +223,24 @@ func far_for_ms() -> int:
 
 func _update_suspend() -> void:
 	if not _suspend_synced:
+		if not _request_suspend(false):
+			return
 		_suspend_synced = true
-		suspend_sink.call(false)
 	var far := not _focused and not force_read and not _near_screen()
 	if not far:
 		_far_since = 0
-		if _suspended:
+		if _suspended and _request_suspend(false):
 			_suspended = false
-			suspend_sink.call(false)
 		return
 	var now_ms := Time.get_ticks_msec()
 	if _far_since == 0:
 		_far_since = now_ms
-	elif not _suspended and now_ms - _far_since > SUSPEND_AFTER_MS:
+	elif not _suspended and now_ms - _far_since > SUSPEND_AFTER_MS and _request_suspend(true):
 		_suspended = true
-		suspend_sink.call(true)
+
+
+func _request_suspend(on: bool) -> bool:
+	return suspend_sink.call(on) == true
 
 
 # The viewport grown by half its size each way: termlings about to scroll into

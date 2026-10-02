@@ -119,6 +119,7 @@ var _bg_pids := {}            # agent pids we put in Darwin background (see _app
 var _bg_focus_seen := -2      # _focused_id the policy last ran for
 var _state_rename_dir: DirAccess   # that task's own DirAccess
 var _ls_run := true
+const CWD_SCAN_INTERVAL_MSEC := 5000
 var _child_mutex := Mutex.new()
 var _child_pids: Array[int] = []
 var _state_accum := 0.0
@@ -504,15 +505,15 @@ func _process(delta: float) -> void:
 # --- terminal discovery -----------------------------------------------------
 
 # kitty MSG_SUSPEND (6): [kind u8][os-window id u64 LE][on u8]. See TermCritter.
-func _send_suspend(on: bool, id: int) -> void:
+func _send_suspend(on: bool, id: int) -> bool:
 	if _sock == null or not _sock.has_method("send_raw") or not _sock.call("is_connected"):
-		return
+		return false
 	var msg := PackedByteArray()
 	msg.resize(10)
 	msg[0] = 6
 	msg.encode_u64(1, id)
 	msg[9] = 1 if on else 0
-	_sock.call("send_raw", msg)
+	return bool(_sock.call("send_raw", msg))
 
 
 func _reconcile() -> void:
@@ -2104,6 +2105,9 @@ func _start_ls_poll() -> void:
 
 func _ls_loop() -> void:
 	var watchdog_tick := 0
+	var last_cwd_scan_msec := -1
+	var cwd_cache := {}
+	var sess_info := {}
 	while _ls_run:
 		# Every ~30s, run the session watchdog: it detects (and heals) abduco
 		# attach clients spinning at 100% cpu and deadlocked session ptys, both
@@ -2116,10 +2120,30 @@ func _ls_loop() -> void:
 		var out := []
 		OS.execute(kitten_exe, ["@", "--to", kitty_socket, "ls"], out, false)
 		var txt: String = out[0] if out.size() > 0 else ""
+		# Agent/idle/tool state is safety-sensitive and stays at one-second latency.
+		# lsof supplies only cwd data and dominates this poll's cost, so cache it.
 		var pout := []
-		OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
+		var ps_status := OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
 		var ptxt: String = pout[0] if pout.size() > 0 else ""
-		var sess_info := _scan_sessions(ptxt)
+		if ps_status == 0 and not ptxt.is_empty():
+			sess_info = _scan_sessions(ptxt, cwd_cache)
+			var now_msec := Time.get_ticks_msec()
+			if _cwd_scan_due(now_msec, last_cwd_scan_msec):
+				var pids := []
+				for sess in sess_info:
+					if int(sess_info[sess]["pid"]) > 0:
+						pids.append(int(sess_info[sess]["pid"]))
+				var fresh_cwds = _cwds_of(pids)
+				if fresh_cwds != null:
+					cwd_cache = {}
+					for sess in sess_info:
+						var pid := int(sess_info[sess]["pid"])
+						if fresh_cwds.has(pid):
+							cwd_cache[sess] = fresh_cwds[pid]
+					sess_info = _scan_sessions(ptxt, cwd_cache)
+					last_cwd_scan_msec = Time.get_ticks_msec()
+		else:
+			sess_info = {}
 		var data := _parse_ls(txt, sess_info)
 		_ls_mutex.lock()
 		_ls_data = data
@@ -2128,11 +2152,16 @@ func _ls_loop() -> void:
 		OS.delay_msec(1000)
 
 
+static func _cwd_scan_due(now_msec: int, last_scan_msec: int) -> bool:
+	return last_scan_msec < 0 or now_msec - last_scan_msec >= CWD_SCAN_INTERVAL_MSEC
+
+
 # Each termling's shell runs inside an abduco session (see cove-shell.sh) so it
 # survives a kitty restart. The shell/agent is then a child of the abduco master,
 # not of the kitty window, so `kitten @ ls` can't see it -- we recover the agent
-# and cwd by walking the process tree from each abduco master instead.
-func _scan_sessions(ptxt: String) -> Dictionary:
+# by walking the process tree from each abduco master instead. Cwds come from the
+# separately throttled session -> cwd cache; idle, agent, tool and activity stay fresh.
+func _scan_sessions(ptxt: String, cwds: Dictionary = {}) -> Dictionary:
 	var cmd := {}    # pid -> command
 	var kids := {}   # ppid -> [pid]
 	for raw in ptxt.split("\n", false):
@@ -2205,15 +2234,8 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 			res[sess]["act"] = _read_activity(sess)
 		if remote_link:
 			remote_sess.append(sess)
-	# One lsof for every session, not one per session: under load each spawn can
-	# take many seconds, and ~60 of them serially kept sessions unlearned for minutes.
-	var pids := []
 	for sess in res:
-		if int(res[sess]["pid"]) > 0:
-			pids.append(int(res[sess]["pid"]))
-	var cwds := _cwds_of(pids)
-	for sess in res:
-		res[sess]["cwd"] = str(cwds.get(int(res[sess]["pid"]), ""))
+		res[sess]["cwd"] = str(cwds.get(sess, ""))
 	for sess in remote_sess:
 		_apply_remote_link(res[sess], sess)
 	return res
@@ -2283,7 +2305,7 @@ func _session_token(c: String) -> String:
 
 
 # pid -> cwd for many pids in a single lsof call (`p<pid>` then `n<path>` lines).
-func _cwds_of(pids: Array) -> Dictionary:
+func _cwds_of(pids: Array):
 	var res := {}
 	if pids.is_empty():
 		return res
@@ -2291,7 +2313,9 @@ func _cwds_of(pids: Array) -> Dictionary:
 	for pid in pids:
 		ids.append(str(pid))
 	var out := []
-	OS.execute("/usr/sbin/lsof", ["-a", "-p", ",".join(ids), "-d", "cwd", "-Fn"], out, false)
+	var status := OS.execute("/usr/sbin/lsof", ["-a", "-p", ",".join(ids), "-d", "cwd", "-Fn"], out, false)
+	if status != 0:
+		return null
 	var txt: String = out[0] if out.size() > 0 else ""
 	var cur := -1
 	for line in txt.split("\n", false):
@@ -5011,6 +5035,7 @@ var _bd_guides: Array = []      # [[from, to]] snap guide lines for the overlay
 var _bd_rot_center := Vector2.ZERO
 var _bd_rot_start := 0.0
 var _bd_tex := {}               # image src -> Texture2D (null if it failed to load)
+var _bd_tex_active := {}        # sources used by the complete board draw in progress
 var _bd_last_input_ms := 0      # last board click/key, for _bd_owns_keyboard
 # Redraw on change, not every frame (see _bd_tick).
 var _bd_live_layer: Node2D      # arrows tied to termlings, which move on their own
@@ -5205,6 +5230,7 @@ func _bd_reindex() -> void:
 		_bd_by_id[str(s["id"])] = s
 		if str(s["type"]) == "bookmark":
 			_bd_bm_apply(s)   # undo and reloads pick up what's been unfurled since
+	_bd_prune_textures()
 	_bd_sel = _bd_sel.filter(func(i): return _bd_by_id.has(i))
 	_cal_apply_all()
 
@@ -6575,6 +6601,8 @@ func _bd_todo_part_at(s: Dictionary, p: Vector2) -> Dictionary:
 func _bd_draw() -> void:
 	if _cam == null:
 		return
+	_bd_texture_draw_begin()
+	_fs_thumb_draw_begin()
 	_bd_drawn_area = _bd_view_area(0.5)
 	_bd_dz = _bd_detail_zoom()
 	var pad := 48.0 + _bd_frame_px() * 2.0   # strokes, shadows, frame titles above
@@ -6585,6 +6613,8 @@ func _bd_draw() -> void:
 		if str(s["type"]) != "frame" and not _bd_is_live(s) and _bd_shown(s) \
 				and _bd_drawn_area.intersects(_bd_bounds(s).grow(pad)):
 			_bd_draw_shape(_bd_layer, s)
+	_bd_texture_draw_end()
+	_fs_thumb_draw_end()
 
 
 # Zoomed out, detail below a pixel or so is skipped: sketchy wobble, hatching,
@@ -8678,6 +8708,7 @@ func _bd_add_image(img: Image, at: Vector2) -> String:
 func _bd_texture(src: String):
 	if src == "":
 		return null
+	_bd_tex_active[src] = true
 	if not _bd_tex.has(src):
 		var tex = null
 		if FileAccess.file_exists(src):
@@ -8687,6 +8718,38 @@ func _bd_texture(src: String):
 				tex = ImageTexture.create_from_image(img)
 		_bd_tex[src] = tex
 	return _bd_tex[src]
+
+
+# Keep decoded board images only for shapes in the current drawing region. A
+# pan reloads newly visible images once, then keeps them until they leave it.
+func _bd_texture_draw_begin() -> void:
+	_bd_tex_active.clear()
+
+
+func _bd_texture_draw_end() -> void:
+	for src in _bd_tex.keys():
+		if not _bd_tex_active.has(src):
+			_bd_tex.erase(src)
+
+
+# Shape changes can release stale textures immediately instead of waiting for
+# the next board draw. This also covers deleted images cached as failed loads.
+func _bd_prune_textures() -> void:
+	var keep := {}
+	for s in _bd_shapes:
+		match str(s["type"]):
+			"image":
+				var src := str(s.get("src", ""))
+				if src != "":
+					keep[src] = true
+			"bookmark":
+				for field in ["image", "favicon"]:
+					var src := str(s.get(field, ""))
+					if src != "":
+						keep[src] = true
+	for src in _bd_tex.keys():
+		if not keep.has(src):
+			_bd_tex.erase(src)
 
 
 func _bd_draw_image(ci: CanvasItem, s: Dictionary) -> void:
@@ -8857,6 +8920,7 @@ func _bd_unfurl_poll() -> void:
 		for s in _bd_shapes:
 			if str(s["type"]) == "bookmark" and str(s.get("url", "")) == url:
 				_bd_bm_apply(s)
+		_bd_prune_textures()
 		_bd_dirty = true
 		_bd_save_in = 0.4
 
@@ -10212,6 +10276,7 @@ const FS_TILE := Vector2(92, 88)
 const FS_MAX := 400             # entries listed per folder
 const FS_RELIST_MS := 2000
 const FS_CHANGES_MS := 5000
+const FS_THUMB_CACHE_MAX := 128
 const FS_FILE_W := 250.0
 const FS_FILE_H := 48.0
 const FS_FOLDER_COL := Color(0.42, 0.62, 0.92)
@@ -10224,7 +10289,10 @@ const FS_ST_NAME := {"M": "modified", "A": "added", "??": "new", "D": "deleted",
 var _fs_cache := {}      # dir -> {entries, more, mtime, checked, used}
 var _fs_changes := {}    # root -> {files, dirs, top, at}
 var _fs_fetch := {}      # out path -> {root, t}
-var _fs_thumbs := {}     # image path -> Texture2D (or null: couldn't load)
+var _fs_thumbs := {}     # bounded LRU, except all thumbnails active in one draw stay resident
+var _fs_thumb_used := {} # image path -> monotonically increasing access number
+var _fs_thumb_active := {} # thumbnails used by the board draw in progress
+var _fs_thumb_clock := 0
 var _fs_thumb_budget := 0
 var _fs_drag := {}       # {id, path, dir, toggle} while an entry is pressed/dragged
 var _fs_active := ""     # the folder frame whose contents were last clicked (it gets the keys)
@@ -10875,8 +10943,6 @@ func _fs_cd(id: int, dir: String) -> bool:
 	var info: Dictionary = _agents.get(pane, {})
 	if pane == 0 or str(info.get("agent", "shell")) != "shell" or not bool(info.get("idle", false)):
 		return false
-	if str(info.get("cwd", "")) == dir:
-		return true
 	_pty(pane, ("cd " + _fs_quote(dir) + "\r").to_utf8_buffer())
 	return true
 
@@ -11338,6 +11404,7 @@ func _fs_ext_col(ext: String) -> Color:
 
 func _fs_thumb(path: String):
 	if _fs_thumbs.has(path):
+		_fs_thumb_touch(path)
 		return _fs_thumbs[path]
 	if _fs_thumb_budget <= 0:
 		_bd_dirty = true   # more next frame
@@ -11354,7 +11421,37 @@ func _fs_thumb(path: String):
 				img.resize(maxi(1, int(img.get_width() * 192.0 / m)), maxi(1, int(img.get_height() * 192.0 / m)))
 			tex = ImageTexture.create_from_image(img)
 	_fs_thumbs[path] = tex
+	_fs_thumb_touch(path)
 	return tex
+
+
+func _fs_thumb_touch(path: String) -> void:
+	_fs_thumb_clock += 1
+	_fs_thumb_used[path] = _fs_thumb_clock
+	_fs_thumb_active[path] = true
+
+
+func _fs_thumb_draw_begin() -> void:
+	_fs_thumb_active.clear()
+
+
+func _fs_thumb_draw_end() -> void:
+	if _fs_thumbs.size() <= FS_THUMB_CACHE_MAX:
+		return
+	var old := []
+	for path in _fs_thumbs:
+		if not _fs_thumb_active.has(path):
+			old.append([int(_fs_thumb_used.get(path, 0)), str(path)])
+	old.sort_custom(func(a, b):
+		return int(a[0]) < int(b[0]) if int(a[0]) != int(b[0]) else str(a[1]) < str(b[1]))
+	var remove := _fs_thumbs.size() - FS_THUMB_CACHE_MAX
+	for item in old:
+		if remove <= 0:
+			break
+		var path: String = item[1]
+		_fs_thumbs.erase(path)
+		_fs_thumb_used.erase(path)
+		remove -= 1
 
 
 func _fs_glyph(ci: CanvasItem, r: Rect2, it: Dictionary, a: float) -> void:
