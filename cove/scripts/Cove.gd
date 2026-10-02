@@ -2174,12 +2174,19 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 			guard += 1
 			var cur: int = queue.pop_front()
 			var lc: String = str(cmd.get(cur, "")).to_lower()
+			var executable := lc.split(" ", false, 1)[0].get_file()
 			if lc.contains("cove-remote attach"):
 				# The shell/agent runs on another Mac (cove-remote): its argv may
 				# name `claude`, but what really runs there is in its meta file.
 				remote_link = true
 				continue
-			if lc.contains("opencode"):
+			# Muse carries the prompt in argv. Match its executable exactly so a
+			# prompt mentioning another agent cannot relabel this session, and only
+			# claim an unclassified tree so Muse tools under Codex stay Codex.
+			if executable in ["muse", "muse.real"]:
+				if agent == "shell":
+					agent = "muse"; agent_pid = cur
+			elif lc.contains("opencode"):
 				agent = "opencode"; agent_pid = cur
 			elif lc.contains("codex") and agent == "shell":
 				agent = "codex"; agent_pid = cur

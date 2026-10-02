@@ -1,6 +1,6 @@
 # Two carriers hauling one terminal. Wanders autonomously, but can be commanded
 # (move to a point / follow another group) by the control channel, and shows the
-# terminal's agent state (claude/codex/opencode) + an attention marker. Grab and
+# terminal's agent state (claude/codex/muse/opencode) + an attention marker. Grab and
 # drag to pick it up; the carriers hang on and it falls to the ground on release.
 extends Node2D
 
@@ -20,6 +20,7 @@ const WANDER_RADIUS := 260.0
 const AGENT_COLORS := {
 	"claude": Color(0.90, 0.58, 0.30),
 	"codex": Color(0.30, 0.80, 0.70),
+	"muse": Color(0.30, 0.58, 0.95),
 	"opencode": Color(0.62, 0.52, 0.92),
 	"shell": Color(0.5, 0.5, 0.55),
 	"page": Color(1.0, 0.76, 0.40),   # a Vibefox page critter (a browser tab)

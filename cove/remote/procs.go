@@ -1,9 +1,21 @@
 package main
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+)
+
+func isMuseCommand(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false
+	}
+	executable := strings.ToLower(filepath.Base(fields[0]))
+	return executable == "muse" || executable == "muse.real"
+}
 
 // scanTree mirrors Cove.gd's _scan_sessions: the agent is the first
-// claude/codex/opencode below the session's shell. The process table and
+// claude/codex/muse/opencode below the session's shell. The process table and
 // command lines come from the kernel (procs_darwin.go, procs_linux.go).
 func scanTree(root int) meta {
 	m := meta{Agent: "shell", Pid: root}
@@ -18,6 +30,10 @@ func scanTree(root int) meta {
 		queue = queue[1:]
 		lc := strings.ToLower(argv(cur, comm[cur]))
 		switch {
+		case isMuseCommand(lc):
+			if m.Agent == "shell" {
+				m.Agent, agentPid = "muse", cur
+			}
 		case strings.Contains(lc, "opencode"):
 			m.Agent, agentPid = "opencode", cur
 		case strings.Contains(lc, "codex") && m.Agent == "shell":
