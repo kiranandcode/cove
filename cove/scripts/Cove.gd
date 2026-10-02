@@ -5286,7 +5286,8 @@ func _bd_font(name: String) -> Font:
 	if not _bd_fonts.has(name):
 		var f := SystemFont.new()
 		f.font_names = PackedStringArray(BD_FONT_NAMES.get(name, BD_FONT_NAMES["sans"]))
-		f.multichannel_signed_distance_field = true   # crisp at every camera zoom
+		# Chalkboard SE's semicolon has invalid contour winding for Godot's MSDF.
+		f.multichannel_signed_distance_field = name != "draw"
 		_bd_fonts[name] = f
 	return _bd_fonts[name]
 
