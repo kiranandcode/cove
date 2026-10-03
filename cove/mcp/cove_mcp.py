@@ -43,6 +43,7 @@ GAP = 40.0   # clearance find_space keeps around everything already on the board
 
 STATUSES = ["working", "needs_you", "blocked", "done"]
 NOTE_TYPES = ["note", "todo", "text"]
+SHARED_TODO_FIELDS = {"add_items", "check", "uncheck", "remove"}
 
 
 def _load(path, default):
@@ -155,6 +156,49 @@ def require_own(shape_id):
         raise ValueError("no shape %r on the board" % shape_id)
     if s.get("owner") != sess:
         raise ValueError("shape %r isn't yours; you can only change shapes you created" % shape_id)
+
+
+def _require_note_update(shape_id, fields):
+    """Owner gets full access; a todo editor gets content-only access."""
+    sess = my_session()
+    if not sess:
+        raise ValueError("no COVE_SESSION: can't prove ownership of board shapes")
+    shape = _shape(shape_id)
+    if shape is None:
+        if str(shape_id).startswith(sess + "."):
+            return None
+        raise ValueError("no shape %r on the board" % shape_id)
+    if shape.get("owner") == sess:
+        return shape
+    editors = shape.get("editors", [])
+    shared = (shape.get("type") == "todo" and isinstance(editors, list)
+              and sess in [str(editor) for editor in editors])
+    if not shared:
+        raise ValueError("shape %r isn't yours; you can only change shapes you created" % shape_id)
+    forbidden = sorted(set(fields) - SHARED_TODO_FIELDS)
+    if forbidden:
+        raise ValueError("shared editors can only change todo content, not %s" % ", ".join(forbidden))
+    return shape
+
+
+def _term_session(ref):
+    """Resolve a live termling reference to its stable session; names must be unique."""
+    terms = _terms()
+    needle = str(ref)
+    exact = [t for t in terms if needle != "" and str(t.get("session", "")) == needle]
+    if exact:
+        return needle
+    matches = [t for t in terms if needle != "" and any(
+        str(t.get(key, "")) == needle for key in ("id", "pane_id", "name"))]
+    sessions = {str(t.get("session", "")) for t in matches}
+    if len(sessions) > 1:
+        raise ValueError("termling reference %r is ambiguous; use its session" % ref)
+    if len(matches) >= 1:
+        session = next(iter(sessions))
+        if session:
+            return session
+        raise ValueError("termling %r has no stable session yet" % ref)
+    raise ValueError("no termling %r (by id, session or name)" % ref)
 
 
 def _frames():
@@ -624,7 +668,7 @@ TOOLS = [
      "description": "Take your own termling out of its frame onto open ground.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "add_note",
-     "description": "Put a note, todo list or text label on the board next to your termling, e.g. your plan as a todo list. You own it: only you (and the user) can change it. Returns its id for update_note/link/delete_notes.",
+     "description": "Put a note, todo list or text label on the board next to your termling. You own it and, by default, only you and the user can change it; share_todo can grant incremental checklist access. Returns its id.",
      "inputSchema": {"type": "object", "properties": {
          "type": {"type": "string", "enum": NOTE_TYPES},
          "text": {"type": "string"},
@@ -635,7 +679,7 @@ TOOLS = [
      "description": "Put a link on the board next to your termling as a bookmark card (title, preview image, favicon), as pasting a URL into tldraw does. GitHub pull requests and issues show their live state (open/draft/merged/closed) and +/- lines, re-checked every few minutes, so this is the way to hand the user a PR you opened. You own the card (delete it with delete_notes). Returns its id.",
      "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
     {"name": "update_note",
-     "description": "Change one of your own board shapes: replace text/color/items, append add_items, check/uncheck/remove a todo item (by index or text), or move/resize it (x, y, w, h).",
+     "description": "Change one of your own board shapes. A shared todo editor may use only incremental checklist fields (add_items, check, uncheck, remove); its owner retains title, layout, style, full-list replacement and deletion.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "text": {"type": "string"}, "color": {"type": "string"},
          "x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"},
@@ -643,6 +687,13 @@ TOOLS = [
          "add_items": {"type": "array", "items": {"type": "string"}},
          "check": {}, "uncheck": {}, "remove": {}},
          "required": ["id"]}},
+    {"name": "share_todo",
+     "description": "Owner-only: replace a todo board's shared editor list with live termlings resolved to stable sessions. An empty list revokes all shared access. Editors can incrementally add/check/uncheck/remove items but cannot rename, move, restyle, replace, delete or reshare the todo.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"},
+         "editors": {"type": "array", "items": {"type": "string"},
+                     "description": "termling ids, sessions, pane ids or unique names"}},
+         "required": ["id", "editors"]}},
     {"name": "link",
      "description": "Draw an arrow from one of your own shapes, one of your children, or 'me' (your termling) to a termling (its id) or a board shape (its id). The arrow is yours. dash: draw (default) / solid / dashed / dotted.",
      "inputSchema": {"type": "object", "properties": {
@@ -872,12 +923,32 @@ def call_tool(name, args):
                "owner": sess, "url": url}
         return dict(send(CMDS, cmd), id=sid)
     if name == "update_note":
-        require_own(args["id"])
+        fields = [key for key in args if key != "id"]
+        _require_note_update(args["id"], fields)
         cmd = {"cmd": "board", "op": "update", "id": args["id"]}
         for k in ("text", "color", "items", "add_items", "check", "uncheck", "remove", "x", "y", "w", "h"):
             if k in args:
                 cmd[k] = args[k]
         return send(CMDS, cmd)
+    if name == "share_todo":
+        require_own(args["id"])
+        shape = _shape(args["id"])
+        if shape is None:
+            raise ValueError("todo %r is not mirrored on the board yet" % args["id"])
+        if shape.get("type") != "todo":
+            raise ValueError("only todo boards can have shared editors")
+        owner = str(shape.get("owner", ""))
+        refs = args.get("editors")
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip()
+                                             for ref in refs):
+            raise ValueError("editors must be a list of nonempty termling references")
+        editors = []
+        for ref in refs:
+            session = _term_session(ref.strip())
+            if session != owner and session not in editors:
+                editors.append(session)
+        cmd = {"cmd": "board", "op": "update", "id": args["id"], "editors": editors}
+        return dict(send(CMDS, cmd), id=args["id"], editors=editors)
     if name == "link":
         t = require_me()
         sess = my_session()

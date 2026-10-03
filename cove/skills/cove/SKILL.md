@@ -51,14 +51,20 @@ error if you aren't in one.
 
 ## Your notes on the board
 
-You can keep your own shapes on the board, placed next to your termling. Only
-you (and the user) can change them.
+You can keep your own shapes on the board, placed next to your termling. By
+default only you (and the user) can change them; todo owners may grant other
+termlings incremental checklist access.
 
 - **`add_note(type, text?, items?, color?)`**: `type` is `note`, `todo` or `text`.
   A `todo` with `items` makes a checklist, which is good for showing your plan.
   Returns the shape id.
-- **`update_note(id, ...)`**: replace `text` / `color` / `items`, append
-  `add_items`, or `check` / `uncheck` / `remove` an item (by index or text).
+- **`update_note(id, ...)`**: change one of your shapes. A shared todo editor may
+  only `add_items`, `check`, `uncheck` or `remove`; the owner retains title,
+  full-list, style, layout and deletion control.
+- **`share_todo(id, editors)`**: owner-only; replace a todo's editors with live
+  termlings resolved to stable sessions. An empty list revokes shared access.
+  Shared editors should address items by exact text, since concurrent changes
+  can shift numeric indices.
 - **`link(to, from?, text?)`**: an arrow from one of your shapes (or `me`, your
   termling) to a termling id or shape id.
 - **`add_link(url)`**: a bookmark card for a link (title, preview image,

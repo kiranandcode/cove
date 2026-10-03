@@ -7346,6 +7346,8 @@ func _bd_insert(copies: Array, offset: Vector2) -> Array:
 	for c in copies:
 		var s: Dictionary = c.duplicate(true)
 		s["id"] = idmap[str(c["id"])]
+		if str(s["type"]) == "todo":
+			s.erase("editors") # sharing is permission for one board, not its copies
 		var grp := str(s.get("group", ""))
 		if grp != "":
 			if not gmap.has(grp):
@@ -7769,8 +7771,48 @@ func _bd_migrate(zones: Array) -> void:
 # op add: type (note|text|todo|frame|rectangle|ellipse|diamond|triangle|arrow),
 #   id (caller-chosen), text, items, color, x/y/w/h or near_pos, from/to (shape
 #   id or termling key), owner (kept as-is). op update: id or name, then text,
-#   color/fill/dash/size/font, x/y/w/h, items, add_items, check/uncheck/remove
-#   (item index or text). op delete: ids.
+#   color/fill/dash/size/font, x/y/w/h, items, editors, add_items,
+#   check/uncheck/remove (item index or text). op delete: ids.
+
+const BD_SHARED_TODO_FIELDS := ["add_items", "check", "uncheck", "remove"]
+const BD_COMMAND_META_FIELDS := ["cmd", "op", "id", "name", "req", "session"]
+
+
+func _bd_command_can_update(s: Dictionary, c: Dictionary) -> bool:
+	var session := str(c.get("session", ""))
+	if session == "":
+		return false
+	if str(s.get("owner", "")) == session:
+		return true
+	if str(s.get("type", "")) != "todo":
+		return false
+	var editors = s.get("editors", [])
+	if typeof(editors) != TYPE_ARRAY or not editors.has(session):
+		return false
+	for key in c:
+		var field := str(key)
+		if not field in BD_COMMAND_META_FIELDS and not field in BD_SHARED_TODO_FIELDS:
+			return false
+	return true
+
+
+func _bd_norm_editors(v) -> Array:
+	var out := []
+	if typeof(v) != TYPE_ARRAY:
+		return out
+	for editor in v:
+		var session := str(editor).strip_edges()
+		if session != "" and not out.has(session):
+			out.append(session)
+	return out
+
+
+func _bd_editor_change_queued(id: String) -> bool:
+	for pending in _bd_cmd_queue:
+		if str(pending.get("op", "")) == "update" and pending.has("editors") \
+				and _bd_lookup(str(pending.get("id", pending.get("name", "")))) == id:
+			return true
+	return false
 
 func _bd_command(c: Dictionary) -> String:
 	var op := str(c.get("op", ""))
@@ -7782,13 +7824,25 @@ func _bd_command(c: Dictionary) -> String:
 			if kind == "bookmark" and not _bd_is_url(str(c.get("url", ""))):
 				return "a bookmark needs an http(s) url"
 		"update":
-			if _bd_lookup(str(c.get("id", c.get("name", "")))) == "":
+			var update_id := _bd_lookup(str(c.get("id", c.get("name", ""))))
+			if update_id == "":
 				return "no such shape"
+			var update_shape: Dictionary = _bd_by_id[update_id]
+			if not _bd_command_can_update(update_shape, c):
+				return "not allowed to update that shape"
+			if str(update_shape.get("owner", "")) != str(c.get("session", "")) \
+					and _bd_editor_change_queued(update_id):
+				return "todo permissions are changing; retry"
 		"delete":
 			var found := false
 			for ref in c.get("ids", []):
-				if _bd_lookup(str(ref)) != "":
+				var delete_id := _bd_lookup(str(ref))
+				if delete_id != "":
 					found = true
+					var doomed: Dictionary = _bd_by_id[delete_id]
+					if str(doomed.get("type", "")) == "todo" \
+							and str(doomed.get("owner", "")) != str(c.get("session", "")):
+						return "not allowed to delete that todo"
 			if not found:
 				return "no such shape"
 		_:
@@ -7811,7 +7865,8 @@ func _bd_exec(c: Dictionary) -> void:
 			var ids := []
 			for ref in c.get("ids", []):
 				var id := _bd_lookup(str(ref))
-				if id != "":
+				if id != "" and (str(_bd_by_id[id].get("type", "")) != "todo" \
+						or str(_bd_by_id[id].get("owner", "")) == str(c.get("session", ""))):
 					ids.append(id)
 			_bd_remove(ids)
 	_bd_commit()
@@ -7932,6 +7987,10 @@ func _bd_exec_update(c: Dictionary) -> void:
 	if id == "":
 		return
 	var s: Dictionary = _bd_by_id[id]
+	# Recheck when a queued command actually runs: an owner may have revoked a
+	# shared editor while the user's in-flight gesture held this command.
+	if not _bd_command_can_update(s, c):
+		return
 	if c.has("text"):
 		s["text"] = str(c["text"])
 	for k in ["color", "fill", "dash", "size", "font"]:
@@ -7944,6 +8003,8 @@ func _bd_exec_update(c: Dictionary) -> void:
 		if c.has("rotation"):
 			s["rot"] = deg_to_rad(float(c["rotation"]))
 	if str(s["type"]) == "todo":
+		if c.has("editors"):
+			s["editors"] = _bd_norm_editors(c["editors"])
 		if c.has("items"):
 			s["items"] = _bd_norm_items(c["items"])
 		var items: Array = s["items"]
