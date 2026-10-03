@@ -45,6 +45,37 @@ func baseDir() string {
 
 func sessionDir(s string) string { return filepath.Join(baseDir(), s) }
 
+func acquireSessionLock(sess string, timeout time.Duration) (*os.File, error) {
+	if err := os.MkdirAll(baseDir(), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(baseDir(), "."+sess+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			f.Close()
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("session %s is already starting or running", sess)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func releaseSessionLock(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
+
 // --- bridge ------------------------------------------------------------------
 
 func runBridge() error {
@@ -135,8 +166,11 @@ type daemon struct {
 
 	ptmx     *os.File
 	cmd      *exec.Cmd
+	root     processRef
+	owned    []processRef
 	exited   bool
 	exitCode int
+	killing  bool
 
 	cur       *dconn
 	clients   int
@@ -163,6 +197,11 @@ func runServe(arg string) error {
 	if err := json.Unmarshal(raw, &h); err != nil {
 		return err
 	}
+	lock, err := acquireSessionLock(h.Session, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer releaseSessionLock(lock)
 	d := &daemon{dir: sessionDir(h.Session)}
 	d.cond = sync.NewCond(&d.mu)
 	d.coveDir = filepath.Join(d.dir, "cove")
@@ -179,13 +218,19 @@ func runServe(arg string) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(sock)
+	retired := false
+	defer func() {
+		if !retired {
+			_ = os.Remove(sock)
+		}
+	}()
 	if err := d.startChild(h); err != nil {
 		return err
 	}
 	log.Printf("session %s: pid %d, cmd %q, cwd %q", h.Session, d.cmd.Process.Pid, h.Cmd, h.Cwd)
 	info, _ := json.Marshal(map[string]any{"session": h.Session, "cmd": h.Cmd, "cwd": h.Cwd,
-		"pid": d.cmd.Process.Pid, "daemon": os.Getpid(), "created": time.Now().Unix()})
+		"pid": d.root.pid, "root_identity": d.root.identity,
+		"daemon": os.Getpid(), "created": time.Now().Unix()})
 	os.WriteFile(filepath.Join(d.dir, "info.json"), info, 0o600)
 	d.touchActivity()
 	if os.Getenv("COVE_REMOTE_NO_CAFFEINATE") == "" {
@@ -211,12 +256,30 @@ func runServe(arg string) error {
 		done := d.exited && (d.delivered || (d.cur == nil && time.Since(lastDetach) > time.Hour))
 		d.mu.Unlock()
 		if done {
+			if err := d.killChild(); err != nil {
+				log.Printf("session cleanup deferred: %v", err)
+				continue
+			}
 			time.Sleep(500 * time.Millisecond)
-			ln.Close()
-			os.RemoveAll(d.dir)
+			_ = ln.Close()
+			if err := retireSessionDir(d.dir); err != nil {
+				return err
+			}
+			retired = true
 			return nil
 		}
 	}
+}
+
+func retireSessionDir(dir string) error {
+	tomb := fmt.Sprintf("%s.dead-%d-%d", dir, os.Getpid(), time.Now().UnixNano())
+	if err := os.Rename(dir, tomb); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return os.RemoveAll(tomb)
 }
 
 var lastDetach = time.Now()
@@ -255,7 +318,15 @@ func (d *daemon) startChild(h hello) error {
 	if err != nil {
 		return err
 	}
+	root, err := waitProcessRef(cmd.Process.Pid, 500*time.Millisecond)
+	if err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
 	d.ptmx, d.cmd = ptmx, cmd
+	d.root, d.owned = root, []processRef{root}
 	return nil
 }
 
@@ -356,6 +427,23 @@ func (d *daemon) readPty() {
 	log.Printf("program exited %d", code)
 }
 
+func (d *daemon) killChild() error {
+	d.mu.Lock()
+	if d.killing {
+		d.mu.Unlock()
+		return errors.New("kill already in progress")
+	}
+	d.killing = true
+	root := d.root
+	owned := append([]processRef(nil), d.owned...)
+	d.mu.Unlock()
+	err := killProcessTree(root, owned)
+	d.mu.Lock()
+	d.killing = false
+	d.mu.Unlock()
+	return err
+}
+
 func (d *daemon) serveConn(c net.Conn) {
 	defer c.Close()
 	r := bufio.NewReaderSize(c, 64<<10)
@@ -398,7 +486,7 @@ func (d *daemon) serveConn(c net.Conn) {
 		from = d.start
 	}
 	w := welcome{InAck: d.inRecv, OutStart: d.start, Head: d.head, From: from,
-		Created: first, Pid: d.cmd.Process.Pid, Exited: d.exited, Proto: 2}
+		Created: first, Pid: d.cmd.Process.Pid, Exited: d.exited, Proto: protocolVersion}
 	metaNow := d.meta
 	d.mu.Unlock()
 	log.Printf("client attached (resume %d, from %d, head %d)", h.Resume, from, w.Head)
@@ -462,9 +550,12 @@ func (d *daemon) serveConn(c net.Conn) {
 				d.putFile(m)
 			}
 		case fKill:
-			if d.cmd.Process != nil {
-				syscall.Kill(-d.cmd.Process.Pid, syscall.SIGHUP)
+			err := d.killChild()
+			result := map[string]any{"ok": err == nil}
+			if err != nil {
+				result["error"] = err.Error()
 			}
+			dc.fw.json(fKill, result)
 		}
 	}
 	d.mu.Lock()
@@ -548,6 +639,11 @@ func (d *daemon) watchMeta() {
 		d.mu.Unlock()
 		if exited {
 			return
+		}
+		if refs, err := captureProcessTree(d.root); err == nil {
+			d.mu.Lock()
+			d.owned = mergeProcessRefs(d.owned, refs)
+			d.mu.Unlock()
 		}
 		m := scanTree(d.cmd.Process.Pid)
 		if m.Pid != cwdPid || time.Since(cwdAt) > 3*time.Second {

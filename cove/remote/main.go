@@ -9,13 +9,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
+	"time"
 )
 
 func main() {
@@ -43,9 +44,13 @@ func main() {
 		for _, a := range os.Args[3:] {
 			rest += " " + shellQuote(a)
 		}
+		remoteVerb := "local-" + os.Args[1]
+		if os.Args[1] == "kill" {
+			remoteVerb = "local-kill-v2" // old remote binaries must fail closed
+		}
 		run := func() error {
 			cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", os.Args[2],
-				shellQuote(self)+" local-"+os.Args[1]+rest)
+				shellQuote(self)+" "+remoteVerb+rest)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			return cmd.Run()
 		}
@@ -58,7 +63,7 @@ func main() {
 		}
 	case "local-ls":
 		err = localLs()
-	case "local-kill":
+	case "local-kill", "local-kill-v2":
 		if len(os.Args) < 3 {
 			usage()
 		}
@@ -114,14 +119,92 @@ func localKill(sess string) error {
 	if !sessionRe.MatchString(sess) {
 		return fmt.Errorf("bad session name %q", sess)
 	}
-	b, err := os.ReadFile(filepath.Join(sessionDir(sess), "info.json"))
+	dir := sessionDir(sess)
+	sock := filepath.Join(dir, "sock")
+	c, err := net.DialTimeout("unix", sock, 2*time.Second)
 	if err != nil {
-		return fmt.Errorf("no session %s", sess)
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			return nil // verified absence makes retries harmless
+		}
+		return killStaleSession(sess, dir)
 	}
-	var info struct{ Pid, Daemon int }
-	json.Unmarshal(b, &info)
-	syscall.Kill(-info.Pid, syscall.SIGHUP)
-	syscall.Kill(info.Daemon, syscall.SIGTERM)
-	os.RemoveAll(sessionDir(sess))
+	defer c.Close()
+	if err := c.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return err
+	}
+	fw := &frameWriter{w: c}
+	h := hello{Session: sess, Client: fmt.Sprintf("kill-%d-%d", os.Getpid(), time.Now().UnixNano()),
+		Resume: -1, Replay: 1}
+	if err := fw.json(fHello, h); err != nil {
+		return err
+	}
+	r := bufio.NewReaderSize(c, 64<<10)
+	f, err := readFrame(r)
+	if err != nil || f.t != fWelcome {
+		return fmt.Errorf("session %s rejected kill control", sess)
+	}
+	var w welcome
+	if json.Unmarshal(f.p, &w) != nil || w.Proto < protocolVersion {
+		return fmt.Errorf("session %s daemon is too old for verified kill; update cove-remote", sess)
+	}
+	if err := fw.write(fKill); err != nil {
+		return err
+	}
+	acked, exited := false, false
+	for {
+		f, err = readFrame(r)
+		if err != nil {
+			return fmt.Errorf("session %s kill was not confirmed: %w", sess, err)
+		}
+		if f.t == fKill {
+			var result struct {
+				OK    bool   `json:"ok"`
+				Error string `json:"error"`
+			}
+			if json.Unmarshal(f.p, &result) != nil {
+				return fmt.Errorf("session %s returned an invalid kill result", sess)
+			}
+			if !result.OK {
+				return fmt.Errorf("session %s kill failed: %s", sess, result.Error)
+			}
+			acked = true
+		}
+		if f.t == fExit {
+			exited = true
+		}
+		if acked && exited {
+			return nil
+		}
+	}
+}
+
+func killStaleSession(sess, dir string) error {
+	lock, err := acquireSessionLock(sess, 0)
+	if err != nil {
+		return fmt.Errorf("session %s is starting or running but its control socket is unavailable", sess)
+	}
+	defer releaseSessionLock(lock)
+	if c, err := net.DialTimeout("unix", filepath.Join(dir, "sock"), 200*time.Millisecond); err == nil {
+		c.Close()
+		return fmt.Errorf("session %s control became available; retry", sess)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "info.json"))
+	if err != nil {
+		return fmt.Errorf("session %s has no verifiable metadata: %w", sess, err)
+	}
+	var info struct {
+		Pid          int    `json:"pid"`
+		RootIdentity string `json:"root_identity"`
+	}
+	if err := json.Unmarshal(b, &info); err != nil || info.Pid <= 1 || info.RootIdentity == "" {
+		return fmt.Errorf("session %s metadata predates verified cleanup", sess)
+	}
+	root := processRef{pid: info.Pid, identity: info.RootIdentity}
+	if err := killProcessTree(root, nil); err != nil {
+		return fmt.Errorf("kill stale session %s: %w", sess, err)
+	}
+	if err := retireSessionDir(dir); err != nil {
+		return fmt.Errorf("retire stale session %s: %w", sess, err)
+	}
 	return nil
 }

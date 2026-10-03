@@ -24,12 +24,12 @@ func argv(pid int, comm string) string {
 }
 
 // procTable maps each pid to its children and its short name.
-func procTable() (kids map[int][]int, comm map[int]string, ok bool) {
+func procTable() (kids map[int][]int, comm, identities map[int]string, ok bool) {
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	kids, comm = map[int][]int{}, map[int]string{}
+	kids, comm, identities = map[int][]int{}, map[int]string{}, map[int]string{}
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
@@ -53,8 +53,28 @@ func procTable() (kids map[int][]int, comm map[int]string, ok bool) {
 		ppid, _ := strconv.Atoi(f[1])
 		kids[ppid] = append(kids[ppid], pid)
 		comm[pid] = s[lp+1 : rp]
+		if len(f) > 19 {
+			identities[pid] = f[19]
+		}
 	}
-	return kids, comm, true
+	return kids, comm, identities, true
+}
+
+func processIdentity(pid int) (string, bool) {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", false
+	}
+	s := string(b)
+	rp := strings.LastIndexByte(s, ')')
+	if rp < 0 {
+		return "", false
+	}
+	f := strings.Fields(s[rp+1:])
+	if len(f) <= 19 {
+		return "", false
+	}
+	return f[19], true // field 22: clock tick when this process started
 }
 
 func cwdOf(pid int) string {

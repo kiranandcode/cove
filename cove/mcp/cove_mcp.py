@@ -67,6 +67,20 @@ def read_board():
     return _load(BOARD, {"shapes": []})
 
 
+def read_board_checked():
+    for attempt in range(5):
+        try:
+            with open(BOARD) as f:
+                board = json.load(f)
+            if not isinstance(board, dict) or not isinstance(board.get("shapes"), list):
+                raise ValueError("invalid board state")
+            return board
+        except (OSError, ValueError) as e:
+            if attempt == 4:
+                raise ValueError("board state unavailable: %s" % e)
+            time.sleep(0.05)
+
+
 def my_session():
     return os.environ.get("COVE_SESSION", "")
 
@@ -276,6 +290,26 @@ def require_child(ref):
     return t
 
 
+def _killable_child_session(ref, lin):
+    """Owned live child, or an exited lineage record retained for cleanup retry."""
+    t = _term(ref)
+    sess = my_session()
+    if t is not None:
+        child = str(t.get("session", ""))
+        if sess and _is_descendant(child, sess, lin):
+            return child
+        raise ValueError("termling %r isn't one you spawned; you can only drive your own children" % ref)
+    needle = str(ref)
+    matches = [s for s, rec in lin.items() if not rec.get("dead")
+               and _is_descendant(s, sess, lin)
+               and needle in (s, str(rec.get("name", "")))]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("child name %r is ambiguous; use its session" % ref)
+    raise ValueError("no live child or pending cleanup %r" % ref)
+
+
 def _events(sess):
     try:
         with open(os.path.join(EVENTS, sess + ".jsonl")) as f:
@@ -398,46 +432,217 @@ def _wait_for_pane(pane, session, zone, timeout=15.0):
 
 
 def _pids_of_session(sess):
-    """(abduco master pid, [descendant pids]) for an abduco session."""
-    out = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    """Session process tree, or None when the process listing itself failed."""
+    refs = _session_refs(sess)
+    if refs is None:
+        return None
+    master, desc = refs
+    return (master[0] if master else None, [ref[0] for ref in desc])
+
+
+def _process_snapshot():
+    try:
+        r = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,lstart=,state=,ucomm=,command="],
+                           capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
     procs, kids = {}, {}
-    for line in out.splitlines():
-        sp = line.split(None, 2)
-        if len(sp) < 3:
+    for line in r.stdout.splitlines():
+        sp = line.split(None, 9)
+        if len(sp) < 10:
             continue
-        pid, ppid = int(sp[0]), int(sp[1])
-        procs[pid] = sp[2]
+        try:
+            pid, ppid = int(sp[0]), int(sp[1])
+        except ValueError:
+            continue
+        procs[pid] = {"ppid": ppid, "start": " ".join(sp[2:7]),
+                      "state": sp[7], "comm": sp[8], "cmd": sp[9]}
         kids.setdefault(ppid, []).append(pid)
-    for pid, cmd in procs.items():
-        if "abduco" in cmd and re.search(r"(^|\s)%s(\s|$)" % re.escape(sess), cmd) and kids.get(pid):
-            desc, q = [], list(kids[pid])
-            while q:
-                c = q.pop()
-                desc.append(c)
-                q.extend(kids.get(c, []))
-            return pid, desc
+    return procs, kids
+
+
+def _session_refs(sess):
+    snapshot = _process_snapshot()
+    if snapshot is None:
+        return None
+    procs, kids = snapshot
+    for pid, proc in procs.items():
+        owns_session = re.search(r"(?:^|\s)-[Aa]\s+%s(?:\s|$)" % re.escape(sess), proc["cmd"])
+        if proc["comm"] != "abduco" or not owns_session or not kids.get(pid):
+            continue
+        desc, seen = [], set()
+
+        def collect(parent):
+            for child in kids.get(parent, []):
+                if child in seen or child not in procs:
+                    continue
+                seen.add(child)
+                collect(child)
+                desc.append((child, procs[child]["start"]))
+
+        # Deepest-first, so parents survive a failed leaf kill.
+        collect(pid)
+        return (pid, proc["start"]), desc
     return None, []
 
 
-def _kill_session(sess):
-    master, desc = _pids_of_session(sess)
-    if master is None:
-        return False
-    for sig in (signal.SIGHUP, signal.SIGTERM):
-        for p in desc:
-            try:
-                os.kill(p, sig)
-            except OSError:
-                pass
-        time.sleep(0.8)
-        if _pids_of_session(sess)[0] is None:
-            return True
-    for p in desc + [master]:
+def _merge_refs(base, extra):
+    seen, out = set(), []
+    for ref in list(base) + list(extra):
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
+
+def _live_refs(refs):
+    snapshot = _process_snapshot()
+    if snapshot is None:
+        return None
+    procs, _kids = snapshot
+    return [ref for ref in refs if ref[0] in procs and procs[ref[0]]["start"] == ref[1]
+            and not str(procs[ref[0]].get("state", "")).startswith("Z")]
+
+
+def _signal_refs(refs, sig, best_effort=True):
+    signaled = []
+    ok = True
+    for ref in refs:
+        live = _live_refs([ref])
+        if live is None:
+            ok = False
+            if not best_effort:
+                break
+            continue
+        if not live:
+            continue
+        pid, start = ref
         try:
-            os.kill(p, signal.SIGKILL)
+            os.kill(pid, sig)
+            signaled.append((pid, start))
+        except ProcessLookupError:
+            continue
         except OSError:
-            pass
-    return True
+            ok = False
+            if not best_effort:
+                break
+    return signaled, ok
+
+
+def _wait_refs_gone(refs, timeout):
+    deadline = time.time() + timeout
+    while True:
+        live = _live_refs(refs)
+        if live == []:
+            return True
+        if live is None:
+            return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _kill_session(sess):
+    tree = _session_refs(sess)
+    if tree is None:
+        return False
+    master, desc = tree
+    if master is None:
+        return True
+    owned = [master] + desc
+    stopped = []
+    success = False
+    try:
+        newly_stopped, ok = _signal_refs(owned, signal.SIGSTOP)
+        stopped = _merge_refs(stopped, newly_stopped)
+        if not ok:
+            return False
+        stable = False
+        for _round in range(4):
+            latest = _session_refs(sess)
+            if latest is None:
+                return False
+            latest_master, latest_desc = latest
+            if latest_master is not None and latest_master != master:
+                return False
+            latest_set = set(latest_desc)
+            stale = [ref for ref in owned if ref != master and ref not in latest_set]
+            expanded = [master] + _merge_refs(stale, latest_desc)
+            if len(expanded) == len(owned):
+                stable = True
+                break
+            owned = expanded
+            newly_stopped, ok = _signal_refs(owned, signal.SIGSTOP)
+            stopped = _merge_refs(stopped, newly_stopped)
+            if not ok:
+                return False
+        if not stable:
+            return False
+        descendants = [ref for ref in owned if ref != master]
+        for ref in descendants:
+            _signaled, ok = _signal_refs([ref], signal.SIGKILL, False)
+            if not ok or not _wait_refs_gone([ref], 2.0):
+                return False
+        _signaled, ok = _signal_refs([master], signal.SIGKILL, False)
+        if not ok:
+            return False
+        success = _wait_refs_gone(owned, 2.0)
+        return success
+    finally:
+        if not success:
+            _signal_refs(stopped, signal.SIGCONT)
+
+
+def _terminate_child_session(sess, rec):
+    host = str(rec.get("host") or "")
+    if host:
+        try:
+            r = subprocess.run([os.path.join(HERE, "..", "bin", "cove-remote"), "kill", host, sess],
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, "remote termination failed: %s" % e
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "exit %d" % r.returncode).strip()[:300]
+            return False, "remote termination failed: %s" % detail
+    if not _kill_session(sess):
+        return False, "local session did not exit"
+    return True, ""
+
+
+def _kill_order(root, lin):
+    victims = [root] + [s for s, rec in lin.items()
+                        if not rec.get("dead") and _is_descendant(s, root, lin)]
+
+    def depth(sess):
+        n, seen = 0, set()
+        while sess != root and sess not in seen:
+            seen.add(sess)
+            sess = (lin.get(sess) or {}).get("parent")
+            n += 1
+        return n
+
+    return sorted(victims, key=lambda s: (-depth(s), s))
+
+
+def _killed_shape_ids(killed, authorized, lin, board):
+    owners = set(authorized)
+    recorded = set()
+    for sess in killed:
+        for key in ("arrow", "frame"):
+            if (lin.get(sess) or {}).get(key):
+                recorded.add(str(lin[sess][key]))
+    gone = {"term:" + sess for sess in killed}
+    ids = []
+    for shape in board.get("shapes", []):
+        owned = str(shape.get("owner", "")) in owners
+        if owned and str(shape.get("id", "")) in recorded:
+            ids.append(str(shape["id"]))
+        if owned and shape.get("type") == "arrow" \
+                and (shape.get("bind_a") in gone or shape.get("bind_b") in gone):
+            ids.append(str(shape["id"]))
+    return sorted(set(ids))
 
 
 # --- board geometry: where things are, and where there's room --------------------
@@ -709,7 +914,7 @@ TOOLS = [
          "teleport": {"type": "boolean"}},
          "required": ["id"]}},
     {"name": "kill",
-     "description": "Close one of YOUR children: ends its shell and agent and removes its termling (and its descendants, and the arrows you drew to it).",
+     "description": "Recursively close one of YOUR children and its descendants. Returns only verified closures in killed; failed/retained remain live. A cleanup_error keeps exited lineage retryable by session. Removes only board artifacts owned by your authorized subtree.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
     {"name": "delete_notes",
      "description": "Delete board shapes you own, by id.",
@@ -732,8 +937,10 @@ def _arrow(t, src, dst, text=None, dash=None, color=None):
 def _child_view(sess, rec, terms_by_sess):
     t = terms_by_sess.get(sess)
     ev = _events(sess)
+    procs = _pids_of_session(sess)
     return {"session": sess, "name": rec.get("name"), "parent": rec.get("parent"),
-            "alive": t is not None or _pids_of_session(sess)[0] is not None,
+            # A failed process scan is unknown, never evidence that a child died.
+            "alive": t is not None or procs is None or procs[0] is not None,
             "id": t.get("id") if t else None,
             "frame": t.get("zone") if t else None, "agent": t.get("agent") if t else None,
             "last_event": ev[-1]["event"] if ev else None,
@@ -1053,7 +1260,8 @@ def call_tool(name, args):
             for s in targets:
                 ev = _events(s)[int((lin.get(s) or {}).get("seen", 0)):]
                 reps = [m for m in mail if m.get("from") == s]
-                if s not in live and _pids_of_session(s)[0] is None:
+                procs = _pids_of_session(s)
+                if s not in live and procs is not None and procs[0] is None:
                     # Gone for real: its abduco session has ended. (Missing from
                     # state.json alone isn't enough: right after a reload the Cove
                     # hasn't relearned sessions yet.)
@@ -1084,43 +1292,52 @@ def call_tool(name, args):
             cmd["pos"] = args["pos"]
         return send(CMDS, cmd)
     if name == "kill":
-        c = require_child(args["id"])
         lin = read_lineage()
-        victims = [c["session"]] + [s for s in lin if _is_descendant(s, c["session"], lin)]
-        arrows = []
-        for s in victims:
-            if (lin.get(s) or {}).get("host"):
-                # Closing the termling only detaches cove-remote; end the session.
-                try:
-                    subprocess.run([os.path.join(HERE, "..", "bin", "cove-remote"), "kill",
-                                    lin[s]["host"], s], capture_output=True, timeout=15)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-            _kill_session(s)
-            if s in lin:
-                lin[s]["dead"] = int(time.time())
-                for k in ("arrow", "frame"):
-                    if lin[s].get(k):
-                        arrows.append(lin[s][k])
-        write_lineage(lin)
-        # Everything that belonged to the killed termlings goes: the arrow and
-        # frame we made for each (keyed by its owner's session: ours for the
-        # child, the child's for its own children), plus any arrow still tied to
-        # one of them. Only deleting ids with *our* prefix left the child's
-        # arrows to its children dangling on the board.
-        owners = tuple(s + "." for s in [my_session()] + victims)
-        gone = {"term:" + s for s in victims}
-        ids = [a for a in arrows if str(a).startswith(owners)]
-        for sh in read_board().get("shapes", []):
-            if sh.get("type") == "arrow" and (sh.get("bind_a") in gone or sh.get("bind_b") in gone):
-                ids.append(str(sh["id"]))
-        ids = sorted(set(ids))
+        root = _killable_child_session(args["id"], lin)
+        victims = _kill_order(root, lin)
+        killed, failed, retained = [], {}, {}
+        for sess in victims:
+            blockers = [s for s in failed if _is_descendant(s, sess, lin)]
+            if blockers:
+                retained[sess] = "descendant %s is still alive" % sorted(blockers)[0]
+                continue
+            ok, why = _terminate_child_session(sess, lin.get(sess) or {})
+            if ok:
+                killed.append(sess)
+            else:
+                failed[sess] = why
+
+        # Remove only artifacts owned by this authorized subtree. User and
+        # unrelated-agent arrows bound to a closed termling remain on the board.
+        caller = my_session()
+        authorized = [caller] + [s for s in lin if _is_descendant(s, caller, lin)]
+        cleanup_error = ""
+        try:
+            board = read_board_checked()
+        except ValueError as e:
+            board, cleanup_error = {"shapes": []}, str(e)
+        ids = _killed_shape_ids(killed, authorized, lin, board)
         if ids:
             try:
-                send(CMDS, {"cmd": "board", "op": "delete", "ids": ids})
-            except ValueError:
-                pass
-        return {"ok": True, "killed": victims}
+                reply = send(CMDS, {"cmd": "board", "op": "delete", "ids": ids})
+                if not reply.get("confirmed", False):
+                    cleanup_error = "board cleanup was not confirmed"
+            except (OSError, ValueError) as e:
+                cleanup_error = str(e)
+        if killed and not cleanup_error:
+            now = int(time.time())
+            for sess in killed:
+                if sess in lin:
+                    lin[sess]["dead"] = now
+            write_lineage(lin)
+        result = {"ok": not failed and not retained and not cleanup_error, "killed": killed}
+        if failed:
+            result["failed"] = failed
+        if retained:
+            result["retained"] = retained
+        if cleanup_error:
+            result["cleanup_error"] = cleanup_error
+        return result
 
     if name == "delete_notes":
         ids = [str(i) for i in args["ids"]]

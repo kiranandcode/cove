@@ -31,8 +31,10 @@ const (
 	fAppend   = 10 // S→C json cove-dir lines the remote agent wrote (notify, commands, ...)
 	fExit     = 11 // S→C json {code}: the session's program ended
 	fInputAck = 12 // S→C u64 input bytes received so far
-	fKill     = 13 // C→S end the session (SIGHUP its process group)
+	fKill     = 13 // C→S end the session; S→C json {ok, error?}
 )
+
+const protocolVersion = 3 // 3: fKill replies only after verified tree closure
 
 const maxFrame = 16 << 20
 

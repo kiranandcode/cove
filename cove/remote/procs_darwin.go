@@ -53,18 +53,29 @@ func argv(pid int, comm string) string {
 }
 
 // procTable maps each pid to its children and its short name.
-func procTable() (kids map[int][]int, comm map[int]string, ok bool) {
+func procTable() (kids map[int][]int, comm, identities map[int]string, ok bool) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	kids, comm = map[int][]int{}, map[int]string{}
+	kids, comm, identities = map[int][]int{}, map[int]string{}, map[int]string{}
 	for _, p := range procs {
 		pid, ppid := int(p.Proc.P_pid), int(p.Eproc.Ppid)
 		kids[ppid] = append(kids[ppid], pid)
 		comm[pid] = unix.ByteSliceToString(p.Proc.P_comm[:])
+		t := p.Proc.P_starttime
+		identities[pid] = fmt.Sprintf("%d:%d", t.Sec, t.Usec)
 	}
-	return kids, comm, true
+	return kids, comm, identities, true
+}
+
+func processIdentity(pid int) (string, bool) {
+	p, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || int(p.Proc.P_pid) != pid {
+		return "", false
+	}
+	t := p.Proc.P_starttime
+	return fmt.Sprintf("%d:%d", t.Sec, t.Usec), true
 }
 
 func cwdOf(pid int) string {
