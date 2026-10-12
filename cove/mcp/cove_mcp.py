@@ -25,6 +25,7 @@ Register in ~/.claude.json under mcpServers, e.g.:
 """
 import sys, json, os, re, time, uuid, random, signal, base64, subprocess, shlex
 import cove_find  # sibling module: semantic terminal resolver
+import cove_harness  # sibling module: look / lint / run (the spatial harness)
 
 DIR = os.environ.get("KITTY_COVE_DIR", "/tmp/cove")
 STATE = os.path.join(DIR, "state.json")
@@ -487,7 +488,7 @@ def _anchor_rect(near):
     return None
 
 
-def find_space(w, h, near=None, inside=None, exclude=()):
+def find_space(w, h, near=None, inside=None, exclude=(), extra=()):
     """Top-left of a w x h rect that overlaps nothing on the board (termlings,
     shapes; frames that would contain it don't count), as close to `near` as
     possible. inside: keep it within that frame."""
@@ -507,6 +508,8 @@ def find_space(w, h, near=None, inside=None, exclude=()):
             r = [float(v) for v in t["rect"]]
             r[3] *= 1.6   # its crew and shadow stand below the screen
             obstacles.append((r, False))
+    for r in extra:   # shapes a run() script has planned but not sent yet
+        obstacles.append(([float(v) for v in r], False))
     a = _anchor_rect(near) if near is not None or not bound else None
     if a is None and bound:
         a = [bound[0], bound[1], 0, 0]
@@ -589,6 +592,22 @@ def screenshot(target=None, pad=80.0, max_px=1600):
             return data, rect
         time.sleep(0.1)
     raise ValueError("the Cove didn't produce a screenshot (is it running a build with the screenshot command?)")
+
+
+def _free_spot(t, kind, n_items=0):
+    """Where a new note/card goes: free space beside the termling, so repeated
+    adds don't pile up on one spot (lint's commonest finding). Falls back to
+    Godot's "near" (just right of the termling) if the board is too crowded."""
+    w, h = {"note": (200, 200), "todo": (300, 60 + 36 * n_items), "text": (200, 40),
+            "bookmark": (300, 320)}.get(kind, (200, 200))
+    # Inside the termling's own frame if it fits there, else anywhere nearby.
+    for inside in ([t["container"]] if t.get("container") else []) + [None]:
+        try:
+            spot = find_space(w, h, near="me", inside=inside)
+            return {"x": spot["x"], "y": spot["y"]}
+        except ValueError:
+            continue
+    return {"near": t["id"]}
 
 
 class Image:
@@ -715,6 +734,20 @@ TOOLS = [
      "description": "Delete board shapes you own, by id.",
      "inputSchema": {"type": "object", "properties": {
          "ids": {"type": "array", "items": {"type": "string"}}}, "required": ["ids"]}},
+    {"name": "look",
+     "description": "See part of the board before you work on it: a screenshot of a region plus full shape data for everything in it (yours marked), a compact overview of the rest of the board (frames with how much they hold, other shapes, termlings), the user's current view, and lint warnings for the region. where: 'me' (default: your frame, else you and your shapes), 'view' (what the user's window shows), a frame/shape id or name, a termling id/name, or [x,y,w,h]. Look again somewhere else for detail there. The user sees a brief outline of where you looked. Read-only.",
+     "inputSchema": {"type": "object", "properties": {
+         "where": {"description": "'me' | 'view' | frame/shape id or name | termling id/name | [x,y,w,h]"},
+         "screenshot": {"type": "boolean", "description": "default true"},
+         "max_px": {"type": "number"}}}},
+    {"name": "lint",
+     "description": "Check the board for layout problems: overlapping notes/text, shapes covering a termling, shapes hanging off a frame's edge, arrows whose end is gone. Default: problems involving your own shapes; where (as in look) checks a region instead. Each issue says whether it's yours to fix (update_note / run). Board-editing tools already lint what they change. Read-only.",
+     "inputSchema": {"type": "object", "properties": {"where": {}}}},
+    {"name": "run",
+     "description": "Code mode: run a Python script against the live board, for anything more than a shape or two (a diagram, a grid of notes, a re-layout of your shapes). Every change it makes lands at once as ONE undo step; if the script raises, nothing changes. print() and a `result` variable come back, with lint for what it made. API (also as bare names): shapes, get(id), rect(id_or_termling), terms, me, view, frames, find_space(w,h,near=None,inside=None), screen(termling,lines=40), lint(); add(type,text='',x,y,w,h,items,url,**style)->id with type note|text|todo|frame|rectangle|ellipse|diamond|triangle|bookmark; note(text,...), text(text,...), todo(title,items,...), frame(title,...), rect_shape/ellipse/diamond/triangle(text,...); arrow(frm,to,text='',**style)->id (frm: 'me', your shape or child; to: any shape id or termling); update(id,**fields), move(id,x,y), delete(*ids). Omitted x/y = free space next to you. style: color, fill (none|semi|solid|pattern), dash (draw|solid|dashed|dotted), size (s|m|l|xl), font (draw|sans|serif|mono). Text heights grow to fit. You can only change shapes you own. dry_run=true: plan and lint without changing anything.",
+     "inputSchema": {"type": "object", "properties": {
+         "code": {"type": "string"}, "dry_run": {"type": "boolean"}},
+         "required": ["code"]}},
 ]
 
 
@@ -752,7 +785,8 @@ def _child_view(sess, rec, terms_by_sess):
 # The client passes COVE_RELAY_HOST, so a remote agent's children run on its
 # host too unless it asks for host "local".
 
-RELAYED = {"whoami", "children", "spawn", "send", "read", "wait", "kill", "place", "link", "screenshot"}
+RELAYED = {"whoami", "children", "spawn", "send", "read", "wait", "kill", "place", "link", "screenshot",
+           "look", "lint", "run"}
 
 
 def _relayed():
@@ -797,9 +831,30 @@ def run_relayed():
     sys.stdout.write(json.dumps(out))
 
 
+# Tools that change the board: their result carries lint for what they changed.
+LINTED = {"add_note", "add_link", "update_note", "link", "add_frame"}
+
+
 def call_tool(name, args):
     if name in RELAYED and _relayed():
         return relay(name, args)
+    res = _call_tool(name, args)
+    if name in LINTED and isinstance(res, dict):
+        shapes = res.pop("shapes", None) or []
+        ids = [res["id"]] if res.get("id") else [args.get("id")] if args.get("id") else []
+        try:
+            issues = cove_harness.lint_after(sys.modules[__name__], shapes, ids)
+        except Exception as e:   # lint is advice: never fail the edit over it
+            issues = [{"kind": "lint_error", "msg": str(e)}]
+        if issues:
+            res["lint"] = issues
+        mine = next((s for s in shapes if s.get("id") in ids), None)
+        if mine and cove_harness.rect_of(mine):
+            res["rect"] = cove_harness.rnd(cove_harness.rect_of(mine))
+    return res
+
+
+def _call_tool(name, args):
     if name == "whoami":
         t = me()
         if not t:
@@ -854,7 +909,8 @@ def call_tool(name, args):
         if kind not in NOTE_TYPES:
             raise ValueError("type must be one of " + ", ".join(NOTE_TYPES))
         sid = "%s.%s" % (sess, uuid.uuid4().hex[:6])
-        cmd = {"cmd": "board", "op": "add", "type": kind, "id": sid, "near": t["id"], "owner": sess}
+        cmd = dict({"cmd": "board", "op": "add", "type": kind, "id": sid, "owner": sess},
+                   **_free_spot(t, kind, len(args.get("items") or [])))
         for k in ("text", "items", "color"):
             if k in args:
                 cmd[k] = args[k]
@@ -868,8 +924,8 @@ def call_tool(name, args):
         if not re.match(r"^https?://\S+$", url):
             raise ValueError("url must be an http(s) URL")
         sid = "%s.%s" % (sess, uuid.uuid4().hex[:6])
-        cmd = {"cmd": "board", "op": "add", "type": "bookmark", "id": sid, "near": t["id"],
-               "owner": sess, "url": url}
+        cmd = dict({"cmd": "board", "op": "add", "type": "bookmark", "id": sid, "owner": sess, "url": url},
+                   **_free_spot(t, "bookmark"))
         return dict(send(CMDS, cmd), id=sid)
     if name == "update_note":
         require_own(args["id"])
@@ -1122,6 +1178,23 @@ def call_tool(name, args):
                 pass
         return {"ok": True, "killed": victims}
 
+    if name == "look":
+        return cove_harness.look(sys.modules[__name__], args.get("where"),
+                                 bool(args.get("screenshot", True)), int(args.get("max_px", 1400)))
+    if name == "lint":
+        m = sys.modules[__name__]
+        shapes = read_board().get("shapes", [])
+        terms = read_state().get("terminals", [])
+        if args.get("where") not in (None, ""):
+            region, what = cove_harness.resolve_region(m, args["where"], shapes, terms)
+            return {"region": cove_harness.rnd(region), "region_is": what,
+                    "issues": cove_harness.lint(m, shapes, terms, region=region)}
+        sess = my_session()
+        mine = {s["id"] for s in shapes if sess and s.get("owner") == sess}
+        return {"issues": cove_harness.lint(m, shapes, terms, focus=mine), "checked": len(mine)}
+    if name == "run":
+        return cove_harness.run(sys.modules[__name__], str(args["code"]), bool(args.get("dry_run", False)))
+
     if name == "delete_notes":
         ids = [str(i) for i in args["ids"]]
         for i in ids:
@@ -1154,7 +1227,7 @@ def main():
         if method == "initialize":
             reply(rid, {"protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "cove", "version": "0.3.0"}})
+                        "serverInfo": {"name": "cove", "version": "0.4.0"}})
         elif method == "tools/list":
             reply(rid, {"tools": TOOLS})
         elif method == "tools/call":
