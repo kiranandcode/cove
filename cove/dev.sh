@@ -53,6 +53,7 @@ EOF
     mv "$DIR/dev-env.new" "$DIR/dev-env"
     COVE_LAUNCH_LOCK_HELD=1 "$APP/reload-kitty.sh"
     "$APP/cove-remote-start.sh" 9>&- || true
+    COVE_KITTY_SOCKET="$SOCK" nohup python3 "$APP/cove-recover.py" watch 9>&- >>/tmp/cove-recover.log 2>&1 &
     exec 9>&-
     exit 0
 fi
@@ -126,6 +127,11 @@ GODOT=$GODOT
 COVE_KITTY_PID=$COVE_KITTY_PID
 EOF
 
+# Snapshot live termlings every 30 s; after a reboot, restore them (cove-recover.py).
+if [ -z "${COVE_NO_RECOVER:-}" ]; then
+    COVE_KITTY_SOCKET="$SOCK" nohup python3 "$APP/cove-recover.py" watch --restore \
+        9>&- >>/tmp/cove-recover.log 2>&1 &
+fi
 # Auto-start remote termlings (relay + peer auto-viewer) — survives Godot reloads.
 "$APP/cove-remote-start.sh" 9>&- || true
 

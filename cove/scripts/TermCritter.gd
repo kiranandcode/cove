@@ -56,6 +56,17 @@ var _backdrop: ColorRect = null          # red background mat, remote only
 var _link_border_sb: StyleBox = null     # violet: a live cove-remote termling
 const LINK_COLOR := Color(0.56, 0.38, 0.96)       # link up
 const LINK_DOWN_COLOR := Color(0.95, 0.62, 0.22)  # reconnecting
+# An agent put to sleep (Cove.gd _apply_sleep_policy): the screen holds the last
+# frame cove-wake.py repainted, see-through, in a grey outline. Typing or
+# scrolling wakes it: the outline pulses and the screen fades back in.
+var asleep := false
+var _waking_ms := 0                      # when waking began; 0 = not waking
+var _sleep_border_sb: StyleBoxFlat = null
+const SLEEP_ALPHA := 0.45
+const SLEEP_COLOR := Color(0.6, 0.62, 0.66, 0.9)
+const WAKE_COLOR := Color(0.92, 0.94, 0.98, 1.0)
+const WAKE_MIN_MS := 2500    # keep "waking" up at least this long (the agent is starting)
+const WAKE_MAX_MS := 8000    # a nudge that didn't wake it falls back to asleep
 var cols := 0
 var rows := 0
 var mouse_mode := 0      # 0 none, 1 button, 2 motion, 3 any
@@ -103,6 +114,8 @@ func setup(id: int, path: String) -> void:
 
 
 func poll() -> void:
+	if asleep or _waking_ms != 0:
+		_tick_sleep()
 	# Opening the file every frame for every termling was ~0.1 ms each, the
 	# Cove's biggest main-thread cost at idle. One handle stays open instead.
 	# Seeking far away first drops stdio's read buffer; a seek straight back to 0
@@ -346,6 +359,10 @@ func _update_nameplate() -> void:
 		_nameplate.text = "%s  @ %s%s  (%d×%d)" % [base, link_host, state, cols, rows]
 		_nameplate.add_theme_color_override("font_color",
 			LINK_COLOR.lightened(0.35) if link_up else LINK_DOWN_COLOR.lightened(0.2))
+	elif asleep or _waking_ms != 0:
+		var st := "waking…" if _waking_ms != 0 else "asleep, type to wake"
+		_nameplate.text = "%s  · %s  (%d×%d)" % [base, st, cols, rows]
+		_nameplate.add_theme_color_override("font_color", SLEEP_COLOR.lightened(0.2))
 	else:
 		_nameplate.text = "%s  (%d×%d)" % [base, cols, rows]
 		_nameplate.remove_theme_color_override("font_color")
@@ -384,6 +401,66 @@ func set_remote_link(host: String, up: bool, state: String = "") -> void:
 	_layout_decorations()
 	_update_nameplate()
 	set_focused(_focused)
+
+
+# The scan saw cove-wake.py holding this termling (on) or the agent back (off).
+func set_asleep(on: bool) -> void:
+	if on == asleep:
+		if on and _waking_ms != 0 and Time.get_ticks_msec() - _waking_ms > WAKE_MAX_MS:
+			_waking_ms = 0   # the nudge didn't take: back to sleep
+			_apply_sleep_look()
+		return
+	asleep = on
+	if not on and _waking_ms == 0:
+		_waking_ms = Time.get_ticks_msec()   # woken from elsewhere (a detached window, an agent's send)
+	elif on:
+		_waking_ms = 0
+	_apply_sleep_look()
+
+
+# Input just went to a sleeping termling: show it waking now, before the next scan.
+func begin_wake() -> void:
+	if asleep and _waking_ms == 0:
+		_waking_ms = Time.get_ticks_msec()
+		_apply_sleep_look()
+
+
+func _apply_sleep_look() -> void:
+	if _border and _sleep_border_sb == null:
+		_ensure_border_styles()
+		var base = _default_border_sb if _default_border_sb is StyleBoxFlat else null
+		_sleep_border_sb = base.duplicate() if base else StyleBoxFlat.new()
+		_sleep_border_sb.bg_color = Color(0, 0, 0, 0)
+		_sleep_border_sb.border_color = SLEEP_COLOR
+	var on := asleep or _waking_ms != 0
+	if _border and link_host == "" and not remote:
+		if on:
+			_border.add_theme_stylebox_override("panel", _sleep_border_sb)
+		elif _default_border_sb:
+			_border.add_theme_stylebox_override("panel", _default_border_sb)
+	if not on:
+		screen.self_modulate.a = 1.0
+	elif _waking_ms == 0:
+		screen.self_modulate.a = SLEEP_ALPHA
+		if _sleep_border_sb:
+			_sleep_border_sb.border_color = SLEEP_COLOR
+	_update_nameplate()
+	set_focused(_focused)
+
+
+# Per frame while asleep or waking: the waking pulse and fade-in.
+func _tick_sleep() -> void:
+	if _waking_ms == 0:
+		return
+	var t := Time.get_ticks_msec() - _waking_ms
+	if not asleep and t >= WAKE_MIN_MS:
+		_waking_ms = 0
+		_apply_sleep_look()
+		return
+	var k := 0.5 + 0.5 * sin(float(t) * 0.008)
+	screen.self_modulate.a = lerpf(screen.self_modulate.a, 1.0 if not asleep else 0.8, 0.08)
+	if _sleep_border_sb:
+		_sleep_border_sb.border_color = SLEEP_COLOR.lerp(WAKE_COLOR, k)
 
 
 func set_custom_name(n: String) -> void:
@@ -519,7 +596,7 @@ func set_focused(focused: bool) -> void:
 	screen.modulate.a = a
 	if _border:
 		# A remote shadow keeps its red border on even when unfocused.
-		_border.visible = focused or remote or link_host != ""
+		_border.visible = focused or remote or link_host != "" or asleep or _waking_ms != 0
 
 
 # Temporary transparency used while previewing a search hit: an occluding

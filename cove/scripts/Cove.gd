@@ -83,6 +83,10 @@ const PRESENT_MAX_ZOOM := 8.0  # present mode may zoom past MAX_ZOOM to fill the
 const VIEW_FILL := 0.92        # fraction of the window a fitted/presented termling spans
 const USER_LAYOUT := "user://cove-layout.json"  # durable name/pos-by-session (survives a cold start)
 var _durable_accum := 0.0
+const LAYOUT_BACKUPS := "user://layout-backups"  # rolling copies, so a clumped board can be undone
+const LAYOUT_BACKUP_EVERY := 600   # seconds between copies
+const LAYOUT_BACKUP_KEEP := 48     # 8 hours of history
+var _last_layout_backup := 0
 
 # input transport
 var _sock: RefCounted = null
@@ -123,6 +127,7 @@ var _child_mutex := Mutex.new()
 var _child_pids: Array[int] = []
 var _state_accum := 0.0
 var _cmd_accum := 0.0
+var _cmd_extra := {}   # extra fields for the current command's reply (see _pump_commands)
 var _follows := {}           # follower term_id -> target term_id
 # Zones: a termling lives in a frame or box on the board once you drop it there.
 # It wanders inside and moves with the shape; drop it on open ground to set it
@@ -1530,6 +1535,12 @@ func _try_connect_sock() -> void:
 func _pty(pane: int, data: PackedByteArray) -> void:
 	if data.is_empty():
 		return
+	for id in _groups:   # typing/scrolling into a sleeping agent wakes it: show that now
+		var t = _groups[id].terminal
+		if t.pane_id == pane:
+			if t.asleep:
+				t.begin_wake()
+			break
 	if _sock != null and _sock.call("is_connected"):
 		_sock.call("send_bytes", pane, data)
 	elif kitten_exe != "":
@@ -2015,6 +2026,23 @@ func _write_durable() -> void:
 	if f:
 		f.store_string(JSON.stringify({"by_session": by, "by_critter": _zone_by_critter}))
 		f.close()
+	_backup_layout()
+
+
+# Every LAYOUT_BACKUP_EVERY seconds keep a copy of the durable layout. It is
+# rewritten every few seconds, so without these a pile-up overwrites the only
+# record of where the termlings were.
+func _backup_layout() -> void:
+	var now := int(Time.get_unix_time_from_system())
+	if now - _last_layout_backup < LAYOUT_BACKUP_EVERY:
+		return
+	_last_layout_backup = now
+	DirAccess.make_dir_recursive_absolute(LAYOUT_BACKUPS)
+	DirAccess.copy_absolute(USER_LAYOUT, "%s/cove-layout-%d.json" % [LAYOUT_BACKUPS, now])
+	var names := Array(DirAccess.get_files_at(LAYOUT_BACKUPS))
+	names.sort()
+	while names.size() > LAYOUT_BACKUP_KEEP:
+		DirAccess.remove_absolute(LAYOUT_BACKUPS + "/" + str(names.pop_front()))
 
 
 func _restore_after_reconcile() -> void:
@@ -2166,6 +2194,7 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 		var agent := "shell"
 		var agent_pid := -1
 		var remote_link := false
+		var asleep := false
 		var direct: Array = kids.get(pid, [])
 		var shell_pid: int = direct[0] if direct.size() > 0 else -1
 		var queue: Array = direct.duplicate()
@@ -2179,6 +2208,9 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 				# name `claude`, but what really runs there is in its meta file.
 				remote_link = true
 				continue
+			if lc.contains("cove-wake.py"):
+				asleep = true   # an agent put to sleep (_apply_sleep_policy): its argv names it, but it isn't running
+				continue
 			if lc.contains("opencode"):
 				agent = "opencode"; agent_pid = cur
 			elif lc.contains("codex") and agent == "shell":
@@ -2191,7 +2223,8 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 		# idle: a bare shell at its prompt (nothing running under it), so it's
 		# safe to type a `cd` into it.
 		var idle: bool = agent == "shell" and shell_pid != -1 and kids.get(shell_pid, []).is_empty()
-		res[sess] = {"agent": agent, "busy": agent != "shell", "idle": idle, "pid": src, "cwd": ""}
+		res[sess] = {"agent": agent, "busy": agent != "shell", "idle": idle, "pid": src, "cwd": "",
+			"asleep": asleep}
 		if agent_pid != -1:
 			# A tool shell (Claude's Bash tool runs `zsh -c ...`) or the caffeinate it
 			# holds during a turn: the agent is working, whatever the hook last said.
@@ -2334,6 +2367,7 @@ func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
 					"title": str(w.get("title", "")),
 					"tool": bool(si.get("tool", false)),
 					"act": si.get("act", []),
+					"asleep": bool(si.get("asleep", false)),
 				}
 				if si.has("remote_host"):
 					res[pane]["remote_host"] = si["remote_host"]
@@ -2418,6 +2452,8 @@ func _apply_agent_info() -> void:
 		_apply_remote_marker(g, str(info.get("title", "")))
 		g.terminal.set_remote_link(str(info.get("remote_host", "")), bool(info.get("remote_up", true)),
 			str(info.get("remote_state", "")))
+		if not g.terminal.page:
+			g.terminal.set_asleep(bool(info.get("asleep", false)))
 		if info.get("attention", false):
 			_attn_ids[id] = true
 			# kitty raising the flag (a bell, an agent waiting) is a ping too
@@ -2480,6 +2516,59 @@ func _apply_bg_policy() -> void:
 			changed = true
 	if changed:
 		_write_atomic(DIR + "/bg-pids.json", JSON.stringify(_bg_pids.keys()))
+	_apply_sleep_policy()
+
+
+# --- idle agents put to sleep ------------------------------------------------
+# The efficiency cores save CPU, not memory: macOS compresses and swaps an idle
+# agent's pages, and with dozens of them that fills up ("out of application
+# memory"). An agent idle for COVE_SLEEP_AFTER_H hours (default 3; 0 = never)
+# that isn't focused or remote is stopped by cove-sleep.py, which leaves
+# cove-wake.py in its termling: typing into it or scrolling it resumes the same
+# conversation in place. cove-sleep.py rechecks with the agent's own records and
+# leaves anything mid-turn, waiting on a prompt, or ambiguous; /tmp/cove-sleep.log.
+
+const SLEEP_AFTER_H := 3.0
+const SLEEP_CHECK_S := 60.0     # how often to look
+const SLEEP_RETRY_S := 1800.0   # an agent cove-sleep.py left awake is asked again after this
+var _sleep_after_s := -1.0
+var _sleep_checked := 0.0
+var _sleep_tried := {}          # agent pid -> when cove-sleep.py was last run for it
+
+
+func _apply_sleep_policy() -> void:
+	var now := Time.get_unix_time_from_system()
+	if now - _sleep_checked < SLEEP_CHECK_S:
+		return
+	_sleep_checked = now
+	if _sleep_after_s < 0.0:
+		var h := OS.get_environment("COVE_SLEEP_AFTER_H")
+		_sleep_after_s = (float(h) if h.is_valid_float() else SLEEP_AFTER_H) * 3600.0
+	if _sleep_after_s <= 0.0:
+		return
+	var seen := {}
+	for id in _groups:
+		var pane: int = _groups[id].terminal.pane_id
+		var info: Dictionary = _agents.get(pane, {})
+		var pid := int(info.get("pid", -1))
+		var agent := str(info.get("agent", ""))
+		if pid <= 0 or not (agent in ["claude", "codex", "opencode"]):
+			continue
+		seen[pid] = true
+		if id == _focused_id or str(info.get("remote_host", "")) != "" or bool(info.get("tool", false)):
+			continue
+		var act: Array = info.get("act", [])
+		if act.size() >= 2 and (str(act[0]) != "idle" or now - float(act[1]) < _sleep_after_s):
+			continue
+		if now - float(_sleep_tried.get(pid, 0.0)) < SLEEP_RETRY_S:
+			continue
+		_sleep_tried[pid] = now
+		_create_process("/bin/sh", ["-c", "exec /usr/bin/python3 \"$0\" \"$@\" >>/tmp/cove-sleep.log 2>&1",
+			ProjectSettings.globalize_path("res://cove-sleep.py"), agent, str(pid), str(pane),
+			str(int(_sleep_after_s))])
+	for pid in _sleep_tried.keys():
+		if not seen.has(pid):
+			_sleep_tried.erase(pid)
 
 
 func _set_bg(pid: int, on: bool) -> void:
@@ -2542,6 +2631,7 @@ func _learn_session(id: int, g: Node2D, session: String) -> void:
 	if _pos_by_session.has(session):
 		var p = _pos_by_session[session]
 		g.position = Vector2(p[0], p[1])
+		g.rehome(g.position)
 	# The session name beats whatever the id-keyed restore applied: after a kitty
 	# restart the ids are fresh, so an id-keyed name belongs to some other termling.
 	if _name_by_session.has(session):
@@ -2716,15 +2806,19 @@ func _pump_commands(delta: float) -> void:
 	var content := f.get_as_text()
 	f.close()
 	DirAccess.remove_absolute(taken)
-	# Commands carrying a "req" id get {"req", "ok", "error"} in replies.jsonl.
+	# Commands carrying a "req" id get {"req", "ok", "error"} in replies.jsonl,
+	# plus whatever the command left in _cmd_extra (a board op: the shapes it touched).
 	var replies := []
 	for line in content.split("\n", false):
 		var c = JSON.parse_string(line)
 		if typeof(c) != TYPE_DICTIONARY:
 			continue
+		_cmd_extra = {}
 		var err := _exec_command(c)
 		if c.has("req"):
-			replies.append({"req": c["req"], "ok": err == "", "error": err if err != "" else null})
+			var r := {"req": c["req"], "ok": err == "", "error": err if err != "" else null}
+			r.merge(_cmd_extra)
+			replies.append(r)
 	if replies.is_empty():
 		return
 	var rpath := DIR + "/replies.jsonl"
@@ -2867,20 +2961,28 @@ func _exec_command(c: Dictionary) -> String:
 		"board":
 			# Drawing on the board. Terminal ids in from/to/near become termling refs.
 			var bc: Dictionary = c.duplicate(true)
-			for k in ["from", "to"]:
-				var v = bc.get(k, null)
-				if typeof(v) == TYPE_FLOAT or typeof(v) == TYPE_INT:
-					var tg := _find(int(v))
-					if tg == null:
-						return "no such terminal: %s" % str(v)
-					bc[k] = _bd_term_key(tg.term_id)
-			if bc.get("near", null) != null:
-				var ng := _find(int(bc["near"]))
-				if ng != null:
-					var tr = _bd_term_rect(_bd_term_key(ng.term_id))
-					var nr: Rect2 = tr if tr != null else Rect2(ng.position, Vector2.ZERO)
-					bc["near_pos"] = [nr.end.x + 60.0, nr.position.y]
-			return _bd_command(bc)
+			for op in ([bc] + Array(bc.get("ops", []))):
+				var rerr := _bd_resolve_terms(op) if typeof(op) == TYPE_DICTIONARY else ""
+				if rerr != "":
+					return rerr
+			var gone := _bd_ops_rect(bc)   # a delete's shapes, before they go
+			var err := _bd_command(bc)
+			if err == "":
+				# Show where the agent worked, and hand back what its op made of the
+				# shapes (autosized text, fitted bookmarks) so it can lint the result.
+				var touched := _bd_ops_ids(bc)
+				_cmd_extra["shapes"] = touched.map(func(i): return _bd_by_id[i])
+				var at := _bd_ops_rect(bc)
+				_bd_presence_add(str(c.get("session", "")), at if at.has_area() else gone, "edit")
+			return err
+		"presence":
+			# An agent looked at part of the board (cove_mcp's look): outline it with
+			# the agent's name for a moment, so the user sees where its attention is.
+			var pr = c.get("rect", null)
+			if not (pr is Array and pr.size() == 4):
+				return "presence needs rect [x, y, w, h]"
+			_bd_presence_add(str(c.get("session", "")),
+				Rect2(float(pr[0]), float(pr[1]), float(pr[2]), float(pr[3])), str(c.get("kind", "look")))
 		"spawn_place":
 			# An agent launched this kitty window for a child termling (cove_mcp's
 			# spawn): put it in its frame the moment it shows up, not wherever new
@@ -4984,6 +5086,7 @@ var _bd_redo_stack: Array = []
 var _bd_pre := ""               # snapshot taken when a change began
 var _bd_save_in := -1.0
 var _bd_cmd_queue: Array = []   # agent commands held until the user's gesture/edit ends
+var _bd_presence: Array = []    # where agents just looked/worked: {rect, name, col, kind, t} (see _bd_presence_add)
 # text editing
 var _bd_edit_id := ""
 var _bd_edit_part := -1         # todo lists: -2 title, >= 0 item index
@@ -5135,7 +5238,7 @@ func _bd_tick(delta: float) -> void:
 			_bd_live_layer.queue_redraw()
 			_bd_ink_layer.queue_redraw()
 	var overlay_live := not _bd_sel.is_empty() or _bd_g != "" or not _bd_laser.is_empty() \
-		or _bd_bind_hint != "" or not _bd_guides.is_empty()
+		or _bd_bind_hint != "" or not _bd_guides.is_empty() or not _bd_presence.is_empty()
 	if overlay_live or _bd_overlay_was_live:
 		_bd_overlay.queue_redraw()   # one more pass after it empties, to clear it
 	_bd_overlay_was_live = overlay_live
@@ -6964,6 +7067,8 @@ func _bd_draw_overlay() -> void:
 			continue
 		var a := clampf(1.0 - float(now - int(q["t"])) / 900.0, 0.0, 1.0)
 		o.draw_line(_bd_laser[i - 1]["p"], q["p"], Color(1.0, 0.25, 0.3, a), 5.0 / z, true)
+	if not _bd_presence.is_empty():
+		_bd_draw_presence(o, z)
 
 
 # --- board: keys -------------------------------------------------------------------
@@ -7773,6 +7878,20 @@ func _bd_migrate(zones: Array) -> void:
 #   (item index or text). op delete: ids.
 
 func _bd_command(c: Dictionary) -> String:
+	var err := _bd_check(c, {})
+	if err != "":
+		return err
+	if _bd_g != "" or _bd_edit_id != "":
+		_bd_cmd_queue.append(c)   # don't fold it into the user's in-flight undo step
+		return ""
+	_bd_exec(c)
+	return ""
+
+
+# Validate one op. made: ids an earlier op of the same batch adds. A batch
+# (cove_mcp's run) is checked whole before any of it runs, so it lands entirely
+# or not at all, and as one undo step.
+func _bd_check(c: Dictionary, made: Dictionary) -> String:
 	var op := str(c.get("op", ""))
 	match op:
 		"add":
@@ -7781,27 +7900,45 @@ func _bd_command(c: Dictionary) -> String:
 				return "unknown shape type: " + kind
 			if kind == "bookmark" and not _bd_is_url(str(c.get("url", ""))):
 				return "a bookmark needs an http(s) url"
+			if str(c.get("id", "")) != "":
+				made[str(c["id"])] = true
 		"update":
-			if _bd_lookup(str(c.get("id", c.get("name", "")))) == "":
-				return "no such shape"
+			var ref := str(c.get("id", c.get("name", "")))
+			if not made.has(ref) and _bd_lookup(ref) == "":
+				return "no such shape: " + ref
 		"delete":
 			var found := false
 			for ref in c.get("ids", []):
-				if _bd_lookup(str(ref)) != "":
+				if made.has(str(ref)) or _bd_lookup(str(ref)) != "":
 					found = true
 			if not found:
 				return "no such shape"
+		"batch":
+			var ops = c.get("ops", [])
+			if typeof(ops) != TYPE_ARRAY or ops.is_empty():
+				return "a batch needs a non-empty ops list"
+			for i in ops.size():
+				if typeof(ops[i]) != TYPE_DICTIONARY or str(ops[i].get("op", "")) == "batch":
+					return "batch op %d: not a board op" % i
+				var e := _bd_check(ops[i], made)
+				if e != "":
+					return "batch op %d: %s" % [i, e]
 		_:
 			return "unknown board op: " + op
-	if _bd_g != "" or _bd_edit_id != "":
-		_bd_cmd_queue.append(c)   # don't fold it into the user's in-flight undo step
-		return ""
-	_bd_exec(c)
 	return ""
 
 
 func _bd_exec(c: Dictionary) -> void:
 	_bd_begin()
+	if str(c.get("op", "")) == "batch":
+		for sub in c.get("ops", []):
+			_bd_exec_one(sub)
+	else:
+		_bd_exec_one(c)
+	_bd_commit()
+
+
+func _bd_exec_one(c: Dictionary) -> void:
 	match str(c.get("op", "")):
 		"add":
 			_bd_exec_add(c)
@@ -7814,7 +7951,99 @@ func _bd_exec(c: Dictionary) -> void:
 				if id != "":
 					ids.append(id)
 			_bd_remove(ids)
-	_bd_commit()
+
+
+# Terminal ids in a board op's from/to become termling refs, and near (a
+# terminal id) becomes near_pos beside its screen.
+func _bd_resolve_terms(bc: Dictionary) -> String:
+	for k in ["from", "to"]:
+		var v = bc.get(k, null)
+		if typeof(v) == TYPE_FLOAT or typeof(v) == TYPE_INT:
+			var tg := _find(int(v))
+			if tg == null:
+				return "no such terminal: %s" % str(v)
+			bc[k] = _bd_term_key(tg.term_id)
+	if bc.get("near", null) != null:
+		var ng := _find(int(bc["near"]))
+		if ng != null:
+			var tr = _bd_term_rect(_bd_term_key(ng.term_id))
+			var nr: Rect2 = tr if tr != null else Rect2(ng.position, Vector2.ZERO)
+			bc["near_pos"] = [nr.end.x + 60.0, nr.position.y]
+	return ""
+
+
+# The shape ids a board command names (a batch: all of its ops').
+func _bd_ops_ids(c: Dictionary) -> Array:
+	var out := []
+	var ops: Array = c.get("ops", []) if str(c.get("op", "")) == "batch" else [c]
+	for o in ops:
+		if typeof(o) != TYPE_DICTIONARY:
+			continue
+		for ref in ([o.get("id", o.get("name", ""))] + Array(o.get("ids", []))):
+			var id := _bd_lookup(str(ref)) if str(ref) != "" else ""
+			if id != "" and not out.has(id):
+				out.append(id)
+	return out
+
+
+# The world rect those shapes cover right now (empty if none exist).
+func _bd_ops_rect(c: Dictionary) -> Rect2:
+	var r := Rect2()
+	for id in _bd_ops_ids(c):
+		var b := _bd_bounds(_bd_by_id[id])
+		r = b if not r.has_area() else r.merge(b)
+	return r
+
+
+# --- board: agent presence ------------------------------------------------------
+# tldraw's lesson from its canvas agents: show where each agent is working. An
+# agent's board edit outlines what it touched, and its look() outlines the region
+# it read, tagged with its termling's name, fading out over a few seconds.
+
+const BD_PRESENCE_MS := {"edit": 2500, "look": 4000}
+
+
+func _bd_presence_add(session: String, r: Rect2, kind: String) -> void:
+	if r.size.x <= 0.0 and r.size.y <= 0.0:
+		return
+	var id := _bd_term_id("term:" + session) if session != "" else -1
+	var nm := _handoff_name(id) if id != -1 else ""
+	if nm == "":
+		nm = "agent"
+	var hues := ["violet", "blue", "light-blue", "orange", "green", "light-red", "light-violet", "light-green"]
+	var col: Color = BD_PALETTE[hues[absi(hash(session if session != "" else nm)) % hues.size()]]
+	# One mark per agent and kind: a new look replaces its last one.
+	_bd_presence = _bd_presence.filter(func(p): return not (p["session"] == session and p["kind"] == kind))
+	_bd_presence.append({"rect": r.grow(10.0), "name": nm, "col": col, "kind": kind,
+		"session": session, "t": Time.get_ticks_msec()})
+
+
+func _bd_draw_presence(o: Node2D, z: float) -> void:
+	var now := Time.get_ticks_msec()
+	_bd_presence = _bd_presence.filter(func(p): return now - int(p["t"]) < int(BD_PRESENCE_MS.get(p["kind"], 2500)))
+	var font := _bd_font("sans")
+	var fs := clampi(int(13.0 / z), 6, 400)
+	for p in _bd_presence:
+		var life := float(BD_PRESENCE_MS.get(p["kind"], 2500))
+		var a := clampf(1.6 * (1.0 - float(now - int(p["t"])) / life), 0.0, 1.0)
+		var r: Rect2 = p["rect"]
+		var col: Color = p["col"]
+		if p["kind"] == "look":
+			o.draw_rect(r, Color(col, 0.05 * a))
+			# dashed outline: the agent's "viewport"
+			var pts := [r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y), r.position]
+			for i in 4:
+				o.draw_dashed_line(pts[i], pts[i + 1], Color(col, 0.8 * a), 2.0 / z, 10.0 / z)
+		else:
+			o.draw_rect(r, Color(col, 0.10 * a))
+			o.draw_rect(r, Color(col, 0.9 * a), false, 2.5 / z)
+		var label := str(p["name"]) + (" · looking" if p["kind"] == "look" else "")
+		var ts := font.get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, fs)
+		var pad := Vector2(6.0, 3.0) / z
+		var chip := Rect2(r.position - Vector2(0, ts.y + 2.0 * pad.y), ts + 2.0 * pad)
+		o.draw_rect(chip, Color(col, a))
+		o.draw_string(font, chip.position + Vector2(pad.x, pad.y + font.get_ascent(fs)), label,
+			HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(0.08, 0.08, 0.1, a))
 
 
 func _bd_lookup(ref: String) -> String:

@@ -199,6 +199,14 @@ func clear_zone() -> void:
 	_zone = null
 
 
+# Cove moved us after we'd already anchored (a session restore after a reload):
+# wander around the new spot, not the one we first appeared at.
+func rehome(at: Vector2) -> void:
+	_home = at
+	_home_set = true
+	_target = at
+
+
 # Its zone (a frame/box on the board) moved: carry the termling along, keeping
 # its home, wander target and any commanded goal in step.
 func translate_by(delta: Vector2) -> void:

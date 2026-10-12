@@ -190,6 +190,13 @@ fi
 
 exec 9>&-
 
+# Snapshot which termlings (and agents) are alive every 30 s; after a reboot
+# killed them all, bring them back first (cove-recover.py). COVE_NO_RECOVER=1 skips.
+if [ -z "${COVE_NO_RECOVER:-}" ]; then
+    COVE_KITTY_SOCKET="$SOCK" nohup python3 "$REPO/cove/cove-recover.py" watch --restore \
+        9>&- >>/tmp/cove-recover.log 2>&1 &
+fi
+
 # Auto-start remote termlings (relay + peer auto-viewer) before the Godot host.
 "$REPO/cove/cove-remote-start.sh" || true
 
